@@ -1,0 +1,182 @@
+// tests/h1write_tests.nv — the API tests for the encoders, written
+// against the signatures.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+//
+// Most of what is asserted here is a REFUSAL, and that is the point of
+// the file: the two rules a caller most reliably gets wrong — a body on
+// a 204, a body on the answer to a HEAD — are enforced by the encoder
+// and not only written down, so a program that ignored the
+// documentation still cannot put the illegal message on a wire.
+
+use std.test
+use h1write
+use h1msg
+
+fn a_host_header() -> H1Headers
+    h1msg.headers([H1Header { name: "Host", value: "example.org" }])
+
+fn a_get() -> H1Request
+    H1Request { method: Get, target: "/", version: Http11, headers: a_host_header() }
+
+fn a_status(code: Int, reason: Str) -> H1Response
+    H1Response { version: Http11, status: code, reason: reason, headers: h1msg.no_headers() }
+
+@test
+fn test_a_request_head_is_bytes_and_nothing_was_invented() [io]
+    test.case("request_head")
+    match h1write.request_head(a_get())
+        Err(_)    => test.fail("that is a well-formed request head")
+        Ok(bytes) =>
+            // `GET / HTTP/1.1\r\nHost: example.org\r\n\r\n` and no
+            // Content-Length, no User-Agent, no Date: an encoder writes
+            // what the head says.
+            test.assert(list.len(bytes) == 39)
+            test.assert(bytes[0] as Int == 0x47)
+
+@test
+fn test_a_response_head_is_bytes() [io]
+    test.case("response_head")
+    match h1write.response_head(a_status(200, "OK"))
+        Ok(bytes) => test.assert(list.len(bytes) > 0)
+        Err(_)    => test.fail("that is a well-formed response head")
+
+@test
+fn test_a_header_value_with_a_newline_in_it_is_refused() [io]
+    // Response splitting, refused rather than sanitised.  A package
+    // that stripped the newline would be deciding, on the calling
+    // program's behalf, that a forged header is acceptable if it is
+    // stripped.
+    test.case("CRLF in a value")
+    let resp = H1Response {
+        version: Http11, status: 200, reason: "OK",
+        headers: h1msg.headers([
+            H1Header { name: "Location", value: "/a\r\nX-Injected: yes" }]) }
+    match h1write.response_head(resp)
+        Ok(_)  => test.fail("that value would have forged a second header")
+        Err(e) =>
+            match e
+                BadHeaderValueToWrite(n) => test.assert(n == "Location")
+                _                        => test.fail("the refusal names the field")
+
+@test
+fn test_a_header_name_that_is_not_a_token_is_refused() [io]
+    test.case("a space in a field name")
+    let resp = H1Response {
+        version: Http11, status: 200, reason: "OK",
+        headers: h1msg.headers([H1Header { name: "X Trace", value: "1" }]) }
+    match h1write.response_head(resp)
+        Ok(_)  => test.fail("a field name is a tchar token")
+        Err(e) =>
+            match e
+                BadHeaderNameToWrite(_) => test.assert(true)
+                _                       => test.fail("the refusal names the field")
+
+@test
+fn test_a_204_may_not_carry_a_body() [io]
+    // The first of the two rules the signature exists to enforce.
+    test.case("204 with bytes")
+    match h1write.response(Get, a_status(204, "No Content"), [0x68 as u8, 0x69 as u8])
+        Ok(_)  => test.fail("RFC 9110 § 15.3.5: a 204 has no body")
+        Err(e) =>
+            match e
+                BodyForbiddenForStatus(s) => test.assert(s == 204)
+                _                         => test.fail("the refusal names the status")
+
+    test.case("and neither may a 304 or a 1xx")
+    match h1write.response(Get, a_status(304, "Not Modified"), [0x68 as u8])
+        Ok(_)  => test.fail("a 304 has no body either")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_answer_to_a_head_may_not_carry_a_body_at_any_status() [io]
+    // The second rule, and the one that is invisible from the response
+    // alone — which is why `response` takes the method that was sent.
+    test.case("200 answering a HEAD")
+    match h1write.response(Head, a_status(200, "OK"), [0x68 as u8, 0x69 as u8])
+        Ok(_)  => test.fail("a response to HEAD carries headers and no bytes")
+        Err(e) =>
+            match e
+                BodyForbiddenForHead => test.assert(true)
+                _                    => test.fail("the refusal names the method")
+
+    test.case("the same response to a GET is fine")
+    match h1write.response(Get, a_status(200, "OK"), [0x68 as u8, 0x69 as u8])
+        Ok(bytes) => test.assert(list.len(bytes) > 2)
+        Err(_)    => test.fail("a 200 with a body is ordinary")
+
+@test
+fn test_a_request_at_http_1_1_needs_a_host() [io]
+    test.case("no Host")
+    let hostless = H1Request {
+        method: Get, target: "/", version: Http11, headers: h1msg.no_headers() }
+    match h1write.request(hostless, [])
+        Ok(_)  => test.fail("RFC 9112 § 3.2 makes Host mandatory at HTTP/1.1")
+        Err(e) =>
+            match e
+                MissingHost => test.assert(true)
+                _           => test.fail("the refusal says which field")
+
+@test
+fn test_the_two_framing_headers_are_never_written_together() [io]
+    test.case("with_content_length drops a Transfer-Encoding")
+    let chunked = h1write.with_chunked(a_host_header())
+    let fixed = h1write.with_content_length(chunked, 12)
+    test.assert(h1msg.has(fixed, "Content-Length"))
+    test.assert(not h1msg.has(fixed, "Transfer-Encoding"))
+
+    test.case("and with_chunked drops a Content-Length")
+    let back = h1write.with_chunked(fixed)
+    test.assert(h1msg.has(back, "Transfer-Encoding"))
+    test.assert(not h1msg.has(back, "Content-Length"))
+
+@test
+fn test_a_chunk_is_not_how_you_end_a_body() [io]
+    // An empty `chunk` would encode as the last chunk and close the
+    // message, which is almost never what a caller with nothing to send
+    // right now means.  Two calls, so a zero-length write cannot end a
+    // response by accident.
+    test.case("an empty chunk")
+    match h1write.chunk([])
+        Ok(_)  => test.fail("an empty chunk would have ended the message")
+        Err(_) => test.assert(true)
+
+    test.case("a chunk with bytes in it")
+    match h1write.chunk([0x68 as u8, 0x69 as u8])
+        Ok(bytes) => test.assert(list.len(bytes) == 7)   // "2\r\nhi\r\n"
+        Err(_)    => test.fail("two bytes are a legal chunk")
+
+@test
+fn test_the_last_chunk_ends_the_body_and_may_carry_trailers() [io]
+    test.case("no trailers")
+    match h1write.last_chunk(h1msg.no_headers())
+        Ok(bytes) => test.assert(list.len(bytes) == 5)   // "0\r\n\r\n"
+        Err(_)    => test.fail("that is the ordinary end of a chunked body")
+
+    test.case("a trailer HTTP forbids in a trailer section")
+    let bad = h1msg.headers([H1Header { name: "Content-Length", value: "3" }])
+    match h1write.last_chunk(bad)
+        Ok(_)  => test.fail("Content-Length may not be a trailer")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_interim_responses_are_values_rather_than_shapes_to_assemble() [io]
+    test.case("100 Continue")
+    test.assert(list.len(h1write.continue_head()) == 25)
+
+    test.case("101 Switching Protocols")
+    match h1write.switching_protocols_head("websocket", h1msg.no_headers())
+        Ok(bytes) => test.assert(list.len(bytes) > 0)
+        Err(_)    => test.fail("that is the handshake every upgrade ends with")
+
+@test
+fn test_a_server_can_answer_a_refusal_in_one_call() [io]
+    test.case("error_head for a malformed request")
+    match h1write.error_head(BadStartLine(0))
+        Some(bytes) => test.assert(list.len(bytes) > 0)
+        None        => test.fail("a 400 is what a malformed request gets")
+
+    test.case("and none for a refusal nobody can be told about")
+    match h1write.error_head(MessageTruncated(4))
+        None    => test.assert(true)
+        Some(_) => test.fail("the peer is already gone")

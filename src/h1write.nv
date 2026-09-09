@@ -1,0 +1,161 @@
+// h1write.nv — HTTP/1.1 messages as bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// AN ENCODER RETURNS BYTES.  It does not take a writer, it does not
+// take a socket and it does not print: a library does not decide for
+// the program that embeds it that something appears anywhere
+// (`docs/publishing.md` § Design).  What comes back is a `[u8]` the
+// caller sends, files, hashes or throws away.
+//
+// AN ENCODER REFUSES WHAT A READER WOULD REFUSE.  The rules in
+// `h1msg` — a 204 has no body, a header value has no newline in it,
+// `Content-Length` and `Transfer-Encoding` are not both present — are
+// enforced HERE and not only documented, because a rule that is only
+// documented is a rule that produces the illegal message and then a bug
+// report from the far end.  That is what `H1EncodeError` is for and why
+// it is a different type from `H1DecodeError`: this one is the calling
+// program's fault.
+//
+// THE STREAMING FORM IS THE PRIMARY ONE.  `response_head` then `chunk`
+// then `last_chunk` writes a body of any size with a constant amount of
+// memory; `response` is the convenience for a caller that already holds
+// the whole body and wants one call.  A package that offered only the
+// second would have made streaming somebody else's problem, which for
+// a codec is most of the problem.
+
+// request_head is a request line and its header section, ending in the
+// blank line.
+//
+// It writes what the head says and adds nothing: no `Host` it invented,
+// no `Content-Length` it computed, no `User-Agent`.  A caller that
+// wants framing headers puts them there — `with_content_length` and
+// `with_chunked` are the two spellings — and `request` is the form that
+// does it for you.
+//
+// ```novo
+// use h1msg
+// use h1write
+//
+// fn main() [io]
+//     let req = H1Request {
+//         method: Get, target: "/", version: Http11,
+//         headers: h1msg.headers([H1Header { name: "Host", value: "e.org" }]) }
+//     match h1write.request_head(req)
+//         Ok(bytes) => println("${list.len(bytes)} byte(s)")
+//         Err(e)    => println(e.message())
+// ```
+pub fn request_head(req: H1Request) -> Result<[u8], H1EncodeError>
+    todo("http-codec-nv.h1write.request_head")
+
+// response_head is a status line and its header section, ending in the
+// blank line.
+pub fn response_head(resp: H1Response) -> Result<[u8], H1EncodeError>
+    todo("http-codec-nv.h1write.response_head")
+
+// with_content_length is the header section plus a `Content-Length`,
+// with any `Transfer-Encoding` removed.
+//
+// Removed rather than left to collide: a caller that switched a
+// response from chunked to fixed-length and forgot to drop the old
+// header would have written the ambiguous message that
+// `h1err.ConflictingFraming` exists to catch, and catching it in your
+// own encoder is later than catching it here.
+pub fn with_content_length(h: H1Headers, len: Int) -> H1Headers
+    todo("http-codec-nv.h1write.with_content_length")
+
+// with_chunked is the header section plus `Transfer-Encoding: chunked`,
+// with any `Content-Length` removed.
+pub fn with_chunked(h: H1Headers) -> H1Headers
+    todo("http-codec-nv.h1write.with_chunked")
+
+// chunk is one chunk of a chunked body: its size in hexadecimal, CRLF,
+// the data, CRLF.
+//
+// An EMPTY `data` would encode as the last chunk and end the message,
+// which is almost never what a caller with nothing to send right now
+// means, so it is refused — `last_chunk` is how you end a body, and
+// making the two different calls is what stops a zero-length write from
+// silently closing a response.
+pub fn chunk(data: [u8]) -> Result<[u8], H1EncodeError>
+    todo("http-codec-nv.h1write.chunk")
+
+// last_chunk ends a chunked body: the zero-size chunk, the trailer
+// fields, and the blank line.
+//
+// Pass `h1msg.no_headers()` for a body with no trailers, which is the
+// ordinary case.  A trailer field HTTP forbids in a trailer section —
+// `Content-Length`, `Transfer-Encoding`, `Host` — is refused here for
+// the same reason the reader refuses one.
+pub fn last_chunk(trailers: H1Headers) -> Result<[u8], H1EncodeError>
+    todo("http-codec-nv.h1write.last_chunk")
+
+// request is a whole request — head, framing header and body — in one
+// call.
+//
+// Adds `Content-Length` for the body it was given, and refuses a
+// request with neither a `Host` header nor an absolute-form target at
+// `HTTP/1.1`.  For a body that does not fit in memory, use
+// `request_head` with `with_chunked` and then `chunk`.
+pub fn request(req: H1Request, body: [u8]) -> Result<[u8], H1EncodeError>
+    todo("http-codec-nv.h1write.request")
+
+// response is a whole response — head, framing header and body — in one
+// call, for the request method it answers.
+//
+// THE SIGNATURE IS THE RULE.  `sent` is there because the two ways to
+// write a response that nobody can read are to put a body on a 204 and
+// to put a body on the answer to a HEAD, and the second is invisible
+// from the response alone.  With the method in hand this call can
+// refuse both — `BodyForbiddenForStatus` and `BodyForbiddenForHead` —
+// rather than leave a caller to consult `h1msg.status_forbids_body` and
+// remember the HEAD case on its own.
+//
+// A 304 keeps the `Content-Length` its headers carry, because RFC 9110
+// § 15.4.5 says a 304 SHOULD carry the header the 200 would have
+// carried; what it may not carry is the bytes.
+//
+// ```novo
+// use h1msg
+// use h1write
+//
+// fn main() [io]
+//     let resp = H1Response {
+//         version: Http11, status: 204, reason: "No Content",
+//         headers: h1msg.no_headers() }
+//     match h1write.response(Get, resp, [0x68 as u8])
+//         Ok(_)  => println("this does not happen")
+//         Err(e) => println(e.message())    // a 204 has no body
+// ```
+pub fn response(sent: H1Method, resp: H1Response, body: [u8]) -> Result<[u8], H1EncodeError>
+    todo("http-codec-nv.h1write.response")
+
+// continue_head is the `100 Continue` interim response, ready to send.
+//
+// A named constant rather than a shape a caller assembles, because a
+// server that answers `Expect: 100-continue` has to send exactly this
+// and then keep the connection in the state it was in — and a server
+// that assembles it by hand gets the second part wrong.
+pub fn continue_head() -> [u8]
+    todo("http-codec-nv.h1write.continue_head")
+
+// switching_protocols_head is a `101` response with the given
+// `Upgrade` and any extra fields.
+//
+// The handshake half of every protocol that starts as HTTP/1.1 and
+// stops being it — websocket-codec-nv's `check_upgrade_request` hands
+// its answer here.  After these bytes go out, nothing else on the
+// connection is HTTP and the caller stops feeding this package.
+pub fn switching_protocols_head(upgrade: Str, extra: H1Headers) -> Result<[u8], H1EncodeError>
+    todo("http-codec-nv.h1write.switching_protocols_head")
+
+// error_head is a minimal response for a refusal a reader produced:
+// the status `h1err.status_for` chose, `Connection: close`, and no
+// body.
+//
+// `None` when the refusal has no answer — the peer is already gone, or
+// the fault was the caller's own.  It exists so that the ordinary
+// server response to a malformed request is one call rather than a
+// paragraph of assembly every server writes slightly differently.
+pub fn error_head(e: H1DecodeError) -> ?[u8]
+    todo("http-codec-nv.h1write.error_head")

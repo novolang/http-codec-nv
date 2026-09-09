@@ -1,0 +1,280 @@
+// h1read.nv — the load-bearing interface: an HTTP/1.1 reader that
+// performs nothing.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SHAPE, AND WHY IT IS THIS ONE
+//
+// `http-codec-nv` is a `core` package, so its budget is no effects at
+// all: it may not open a socket, set a timeout, or wait.  An HTTP
+// message is exactly the thing a caller wants to stream, and a large
+// one is exactly the thing a caller cannot afford to hold.  Those facts
+// are reconciled by a FEED-AND-DRAIN STATE MACHINE: the host holds the
+// connection, hands this package whatever bytes it has, and takes back
+// the events those bytes completed.
+//
+//     var r = h1read.reader(ReadsRequests, h1read.default_limits())
+//     let step = h1read.feed(r, chunk)!      // as many times as you like
+//     let more = h1read.take(step.reader)!   // until `event` is None
+//
+// ONE EVENT PER CALL, and `event: None` means "not yet" rather than
+// "never".  That is the same distinction `hci-codec-nv` draws between
+// its `Scan` and its `DecodeError`, arrived at here for the same
+// reason: a partial message is the normal case on a socket, and a codec
+// that reported it as an error would have every caller filtering one
+// error variant out of its logs forever.
+//
+// WHY A READER READS ONE DIRECTION
+//
+// `H1Role` fixes what a reader parses, because a request head and a
+// response head are two different grammars that begin with tokens you
+// cannot tell apart until the second field.  A server holds a
+// `ReadsRequests`; a client holds a `ReadsResponses`; nothing holds
+// one that guesses.
+//
+// THE ONE THING A CLIENT MUST TELL THE READER
+//
+// A response's framing depends on the method of the request it answers
+// (`h1msg.response_framing` says why), and a reader cannot know that:
+// the request went out through a socket this package never saw.  So a
+// client calls `expect` with the method it sent, before the response
+// arrives.  A `ReadsResponses` reader that was never told refuses with
+// `MessageStillOpen` rather than guessing GET — guessing GET is how a
+// client hangs forever on a HEAD.
+
+// H1Role is which direction of the conversation a reader parses.
+pub enum H1Role
+    // A server's reader: request heads in, response heads out.
+    ReadsRequests
+    // A client's reader: response heads in, and `expect` must be told
+    // the method of each request that went out.
+    ReadsResponses
+
+// H1Limits is what a reader will refuse to grow past.
+//
+// Every one of these exists because the corresponding unbounded version
+// is a denial of service that costs the attacker one open socket: a
+// head with no blank line, a header section of a million fields, a
+// chunk claiming 2^63 bytes.  They are a value the caller owns rather
+// than constants this package chose, because an embedded consumer wants
+// numbers three orders of magnitude smaller than a reverse proxy does.
+pub struct H1Limits
+    // Bytes in the start line and header section together, before the
+    // blank line that ends them.  Exceeding it is `HeadTooLarge`, which
+    // `h1err.status_for` answers 431.
+    max_head: Int
+    // Fields in one header section, and separately in one trailer
+    // section.  Exceeding it is `TooManyHeaders`.
+    max_headers: Int
+    // Bytes in one chunk of a chunked body.  Exceeding it is
+    // `ChunkTooLarge`.  It bounds the buffer, not the message: a body
+    // of any size passes through in chunks this big.
+    max_chunk: Int
+
+// H1Event is one thing that came out of a reader.
+//
+// A message arrives as a head, then zero or more `BodyBytes`, then at
+// most one `Trailers`, then exactly one `MessageDone`.  A caller that
+// only wants whole small messages accumulates the `BodyBytes` itself;
+// a caller streaming a 4 GB upload writes each one out and keeps
+// nothing, which is the case the head/body split exists for.
+pub enum H1Event
+    // A request head, complete.  Only from a `ReadsRequests` reader.
+    RequestHead(req: H1Request)
+    // A response head, complete.  Only from a `ReadsResponses` reader.
+    // A 1xx arrives as its own `ResponseHead` followed immediately by
+    // `MessageDone`, and the real response follows — `h1msg`'s
+    // `is_informational` is how a caller tells them apart.
+    ResponseHead(resp: H1Response)
+    // Some of the body.  NOT a whole chunk and not a whole anything:
+    // the reader hands over what it has, chunk framing already removed,
+    // and the number of these events for a given body is an artefact of
+    // how the host read its socket.  A caller that treats one
+    // `BodyBytes` as one application message has written a bug that
+    // works on localhost.
+    BodyBytes(data: [u8])
+    // The trailer section of a chunked body.  At most one, immediately
+    // before `MessageDone`, and absent when there was none.
+    Trailers(fields: H1Headers)
+    // The message ended.  After this the reader is ready for the next
+    // one on the same connection — if `h1msg.may_reuse` said there may
+    // be a next one.
+    MessageDone
+
+// H1Step is a reader and the one event that came out of it, if one did.
+//
+// A struct rather than a tuple because a tuple's components come out
+// only through `match`, which reads badly for a value whose two halves
+// are used at different places: the caller reassigns one and dispatches
+// on the other.  csv-nv returns a tuple here and hci-codec-nv a struct;
+// this package follows hci-codec-nv, because an HTTP caller loops on
+// the event and carries the reader across iterations rather than
+// destructuring both once.
+pub struct H1Step
+    reader: H1Reader
+    // `None` means "no complete event in what I have been given yet",
+    // which on a socket is the ordinary case and not a fault.
+    event: ?H1Event
+
+// H1Reader is the state between "some bytes turned up" and "here is an
+// event".
+//
+// Opaque: the fields are here because a struct needs them, and a caller
+// that reaches into one has coupled itself to a buffering decision this
+// package intends to change.  `pending_len` and `offset` are the two
+// facts about a reader that are anybody's business.
+pub struct H1Reader
+    role: H1Role
+    limits: H1Limits
+    pending: [u8]
+    consumed: Int
+
+// H1Drained is a reader and every event a drain produced.
+pub struct H1Drained
+    reader: H1Reader
+    events: [H1Event]
+
+// default_limits is a head of 64 KiB, 128 fields and chunks of 1 MiB.
+//
+// The numbers are nginx's `large_client_header_buffers` and Go's
+// `MaxHeaderBytes` rounded to the same order, which is to say: what a
+// server on the open internet survives with.  An embedded caller should
+// pass its own, an order of magnitude smaller.
+pub fn default_limits() -> H1Limits
+    todo("http-codec-nv.h1read.default_limits")
+
+// embedded_limits is a head of 1 KiB, 16 fields and chunks of 512
+// bytes.
+//
+// Named rather than left to each device caller to invent, because the
+// number that matters on a microcontroller is the one that fits beside
+// everything else in 64 KiB of RAM, and every caller inventing it
+// separately gets a different answer.
+pub fn embedded_limits() -> H1Limits
+    todo("http-codec-nv.h1read.embedded_limits")
+
+// reader is a reader holding nothing, for one direction and one set of
+// limits.
+pub fn reader(role: H1Role, limits: H1Limits) -> H1Reader
+    todo("http-codec-nv.h1read.reader")
+
+// expect tells a client's reader the method of a request that has gone
+// out, so the response to it can be framed.
+//
+// Called once per request, in the order the requests were written —
+// which is the order the responses come back in, because HTTP/1.1
+// pipelining is the only ordering there is.  A `ReadsRequests` reader
+// ignores this.
+//
+// It is a function on the reader and not a field on `feed` because a
+// pipelining client sends three requests before the first response
+// arrives, and the queue of methods has to live somewhere the reader
+// can reach.
+pub fn expect(r: H1Reader, sent: H1Method) -> H1Reader
+    todo("http-codec-nv.h1read.expect")
+
+// feed adds bytes and takes one event, if the addition completed one.
+//
+// Drains ONE event.  A feed that completes three — a small request that
+// arrived in a single packet completes its head, its body and its end —
+// leaves two inside, and `take` is what gets them.  `drain` is that
+// loop written once.
+//
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     let r = h1read.reader(ReadsRequests, h1read.default_limits())
+//     match h1read.feed(r, [0x47 as u8, 0x45 as u8, 0x54 as u8])
+//         Ok(step) =>
+//             match step.event
+//                 None    => println("partial, as expected")
+//                 Some(_) => println("an event")
+//         Err(e)   => println(e.message())
+// ```
+pub fn feed(r: H1Reader, bytes: [u8]) -> Result<H1Step, H1DecodeError>
+    todo("http-codec-nv.h1read.feed")
+
+// take takes one event if a complete one is already buffered, adding
+// nothing.
+//
+// `event` is `None` when the buffer holds a prefix, and the reader
+// comes back unchanged.  A caller loops on this until `None` and then
+// goes back to its socket.
+pub fn take(r: H1Reader) -> Result<H1Step, H1DecodeError>
+    todo("http-codec-nv.h1read.take")
+
+// finish tells the reader the peer closed, and takes the last event.
+//
+// This is not a formality.  A response framed `UntilClose` ENDS at the
+// close — the close is the framing — so its `MessageDone` exists only
+// if somebody says the close happened.  A close in the middle of any
+// other message is `MessageTruncated`, and a close between messages
+// gives `event: None` and no error, which is an ordinary end of
+// connection.
+pub fn finish(r: H1Reader) -> Result<H1Step, H1DecodeError>
+    todo("http-codec-nv.h1read.finish")
+
+// pending_len is how many bytes the reader is holding.
+//
+// For a caller that bounds its own buffering, and for a supervisor that
+// wants to notice a peer sitting on half a message forever.  The
+// limits bound this too, but a caller may want to act before they do.
+pub fn pending_len(r: H1Reader) -> Int
+    todo("http-codec-nv.h1read.pending_len")
+
+// offset is how many bytes this reader has consumed since it was made.
+//
+// The same counter every `H1DecodeError`'s `at` is measured in, so a
+// caller can report a fault's position on a connection without keeping
+// a count of its own.
+pub fn offset(r: H1Reader) -> Int
+    todo("http-codec-nv.h1read.offset")
+
+// message_open says whether a message is in progress — a head has
+// arrived and its `MessageDone` has not.
+//
+// A caller closing a connection between messages is doing something
+// ordinary; a caller closing one mid-message has to say so to the other
+// end, which is the difference this answers.
+pub fn message_open(r: H1Reader) -> Bool
+    todo("http-codec-nv.h1read.message_open")
+
+// drain reads from `src` until one message ends or the source stops
+// giving, and returns every event that came out.
+//
+// THE LOAD-BEARING SIGNATURE OF THIS PACKAGE.  `S: Read[e]` binds the
+// effect parameter of the standard library's `Read` trait and the
+// clause is `[e]`, so the row means "whatever the impl behind `S`
+// supplies": `[io, net]` against a `TcpStream`, nothing against an
+// in-memory `Buffer`.  Naming `[e]` has not spent an effect — it has
+// said "whatever you hand me" — which is what lets a `core` package
+// offer the read-until-done loop instead of making every caller write
+// it (SPEC § 5.6, and `docs/publishing.md` § Design calls this the
+// direct shape for a core package taking a stream from its host).
+//
+// It is the same machine as `feed` and `take` with the pump written
+// once, here, instead of once per caller.  Use `feed` when the bytes
+// arrive from somewhere this does not fit — a TLS record layer, a
+// decompressor, a browser's fetch — and use this otherwise.
+//
+// It is the ONLY function in the package with a row, and the only one
+// that could have had one: everything else takes bytes the caller
+// already holds.
+pub fn drain<S: Read[e]>(r: H1Reader, src: S) -> Result<H1Drained, H1DecodeError> [e]
+    todo("http-codec-nv.h1read.drain")
+
+// parse_head reads one complete head out of a byte list, for a caller
+// that already has the whole thing.
+//
+// The shape `std.http`'s `http_server_parse_head` has, with two
+// differences that are the reason this package exists: it takes bytes
+// rather than a `Str`, so a head with an invalid UTF-8 byte in it is
+// refused rather than mangled on the way in; and it returns a reason
+// with an offset rather than `None`.
+//
+// It reads the HEAD only.  Whatever follows the blank line is the body,
+// and framing it is `h1msg.request_framing`'s job — which is why this
+// returns the byte count it consumed alongside the head.
+pub fn parse_head(bytes: [u8], role: H1Role, limits: H1Limits) -> Result<H1Step, H1DecodeError>
+    todo("http-codec-nv.h1read.parse_head")
