@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.0.2 — 2026-09-10
+
+- **Toolchain floor is 0.8.9**: the bodies and signatures use what 0.8.9 added (`todo()`, a bound effect parameter, the four layers), and the manifest says so instead of letting an older toolchain fail on an undefined function.  No signature changed.
+
 ## 0.0.1 — 2026-09-09
 
 The **interface**, before anyone implements it. Every signature, every
