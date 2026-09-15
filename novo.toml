@@ -1,6 +1,6 @@
 [package]
 name        = "http-codec-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "HTTP/1.1 request and response as a state machine that performs nothing: feed it bytes and take a head, then body chunks, then an end.  Content-Length and chunked framing, a header list with case-insensitive lookup that keeps the case it arrived in, refusals that name the byte offset, and encoders that return bytes.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

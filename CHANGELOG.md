@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.0.3 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.2 — 2026-09-10
 
 - **Toolchain floor is 0.8.9**: the bodies and signatures use what 0.8.9 added (`todo()`, a bound effect parameter, the four layers), and the manifest says so instead of letting an older toolchain fail on an undefined function.  No signature changed.
@@ -59,3 +63,27 @@ and do not affect its surface:
 `a-struct-bound-two-constructors-deep-in-a-match-pattern-is-an-ice`,
 which is why `tests/h1read_tests.nv` splits one match in two; and
 `a-call-qualified-with-the-wrong-sibling-module-emits-invalid-ir-instead-of-e2003`.
+
+### Design notes
+
+The port took its shape from two reference implementations. `httparse`
+supplied the head parser's "resume from where you stopped" contract,
+which is why `H1Reader` carries an offset rather than restarting a parse
+on every chunk. `h11` supplied the state machine, whose separation of a
+connection's two halves into two readers with one role each became
+`H1Role`.
+
+Three things changed in the port. `httparse`'s `Status<T>` — `Complete`
+or `Partial` — became `event: ?H1Event` on a step, because a partial
+message is the ordinary case on a socket and a codec that reported it in
+the error channel would have every caller filtering one variant out of
+its logs forever. `h11`'s single connection with a role field became
+`H1Role` on the reader, so a server cannot accidentally parse a
+response. And `h11`'s exceptions became two error types rather than one,
+so a caller matching on either is not writing arms it can never reach.
+
+The types are named `H1…` because `std.http` already owns `HttpRequest`,
+`HttpResponse` and `HttpHeader`, and a public type name is unique across
+a whole assembly rather than per package. `H1` is what the reference
+implementations call this wire format when they have to distinguish it
+from HTTP/2.
