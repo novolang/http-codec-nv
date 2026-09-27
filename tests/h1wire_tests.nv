@@ -1,0 +1,490 @@
+// tests/h1wire_tests.nv — whole messages on the wire, read by the
+// reader.
+//
+// Each vector is the bytes a peer sends and a one-line summary of the
+// events the reader answers, or of the refusal it stops with.  The
+// messages are RFC 9112's and RFC 9110's own examples, and the cases
+// the h11 and httparse suites test: a folded header line, whitespace
+// before a colon, a line ending in a bare line feed, empty lines before
+// a request, a chunk extension, both framing headers at once.
+//
+// Every vector is read three ways: in one piece, three bytes at a
+// time, and one byte at a time.  The three summaries must be equal,
+// offsets in a refusal included, because a chunk boundary is how the
+// host read its socket and not part of the message.
+
+use std.test
+use std.str
+use std.bytes
+use h1msg
+use h1read
+use h1err
+
+fn wire(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+// A header section as `;name=value` items.
+fn fields_text(h: H1Headers) -> Str
+    var s = ""
+    for f in h1msg.fields_of(h)
+        s = s + ";" + f.name + "=" + f.value
+    s
+
+// One event as text.  Body bytes are summarised by the caller, which
+// joins consecutive ones.
+fn event_text(ev: H1Event) -> Str
+    match ev
+        RequestHead(req)  => "req " + h1msg.method_token(req.method) + " " + req.target + " " + h1msg.version_text(req.version) + fields_text(req.headers)
+        ResponseHead(rsp) => "resp " + h1msg.version_text(rsp.version) + " ${rsp.status} " + rsp.reason + fields_text(rsp.headers)
+        BodyBytes(_)      => "body"
+        Trailers(h)       => "trailers" + fields_text(h)
+        MessageDone       => "done"
+
+// The text of body bytes.
+fn text_of(data: [u8]) -> Str
+    let sb = str.builder_new()
+    for b in data
+        str.builder_append_char(sb, b as Int)
+    let s = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    s
+
+// The events as one line: items joined with " | ", consecutive body
+// bytes joined into one `body:` item.
+fn summary(events: [H1Event]) -> Str
+    var items: [Str] = []
+    var body = ""
+    var in_body = false
+    for ev in events
+        match ev
+            BodyBytes(data) =>
+                body = body + text_of(data)
+                in_body = true
+            _               =>
+                if in_body
+                    items = list.push(items, "body:" + body)
+                    body = ""
+                    in_body = false
+                items = list.push(items, event_text(ev))
+    if in_body
+        items = list.push(items, "body:" + body)
+    str.join(items, " | ")
+
+// Takes events until the reader answers `None`.
+fn take_all(r: H1Reader, events: [H1Event]) -> Result<H1Drained, H1DecodeError>
+    var cur = r
+    var out = events[:]
+    loop
+        let step = h1read.take(cur)!
+        cur = step.reader
+        match step.event
+            Some(ev) =>
+                out = list.push(out, ev)
+            None     =>
+                return Ok(H1Drained { reader: cur, events: out })
+
+// Feeds `input` to `r` in pieces of `piece` bytes, taking every event
+// after each piece, and then finishes the reader when `close` is set.
+fn read_in_pieces(r: H1Reader, input: [u8], piece: Int,
+                  close: Bool) -> Result<[H1Event], H1DecodeError>
+    var cur = r
+    var events: [H1Event] = []
+    let n = list.len(input)
+    for k in 0..(n + piece - 1) / piece
+        let at = k * piece
+        var hi = at + piece
+        if hi > n
+            hi = n
+        let step = h1read.feed(cur, input[at:hi])!
+        cur = step.reader
+        match step.event
+            Some(ev) =>
+                events = list.push(events, ev)
+            None     => ()
+        let d = take_all(cur, events)!
+        cur = d.reader
+        events = d.events[:]
+    if close
+        let step = h1read.finish(cur)!
+        cur = step.reader
+        match step.event
+            Some(ev) =>
+                events = list.push(events, ev)
+            None     => ()
+        let d = take_all(cur, events)!
+        events = d.events[:]
+    Ok(events)
+
+// The summary of one reading, or the refusal as `error: <message>`.
+fn outcome(r: H1Reader, input: Str, piece: Int, close: Bool) -> Str
+    match read_in_pieces(r, wire(input), piece, close)
+        Ok(events) => summary(events)
+        Err(e)     => "error: " + e.message()
+
+// Asserts that a reader answers `want` for `input` read whole, three
+// bytes at a time and one byte at a time.
+fn check(label: Str, r: H1Reader, input: Str, close: Bool, want: Str)
+    test.case(label)
+    test.assert_eq_str(outcome(r, input, 1000000, close), want)
+    test.assert_eq_str(outcome(r, input, 3, close), want)
+    test.assert_eq_str(outcome(r, input, 1, close), want)
+
+fn server() -> H1Reader
+    h1read.reader(ReadsRequests, h1read.default_limits())
+
+fn client(sent: [H1Method]) -> H1Reader
+    var r = h1read.reader(ReadsResponses, h1read.default_limits())
+    for m in sent
+        r = h1read.expect(r, m)
+    r
+
+@test
+fn test_the_four_target_forms_of_rfc_9112_section_3_2() [io]
+    check("origin-form", server(),
+        "GET /where?q=now HTTP/1.1\r\nHost: www.example.org\r\n\r\n", false,
+        "req GET /where?q=now HTTP/1.1;Host=www.example.org | done")
+    check("absolute-form", server(),
+        "GET http://www.example.org/pub/WWW/TheProject.html HTTP/1.1\r\n\r\n", false,
+        "req GET http://www.example.org/pub/WWW/TheProject.html HTTP/1.1 | done")
+    check("authority-form", server(),
+        "CONNECT www.example.com:80 HTTP/1.1\r\nHost: www.example.com\r\n\r\n", false,
+        "req CONNECT www.example.com:80 HTTP/1.1;Host=www.example.com | done")
+    check("asterisk-form", server(),
+        "OPTIONS * HTTP/1.1\r\nHost: www.example.org:8001\r\n\r\n", false,
+        "req OPTIONS * HTTP/1.1;Host=www.example.org:8001 | done")
+    check("an IPv6 literal with CONNECT", server(),
+        "CONNECT [2001:db8::1]:443 HTTP/1.1\r\n\r\n", false,
+        "req CONNECT [2001:db8::1]:443 HTTP/1.1 | done")
+
+@test
+fn test_a_body_framed_by_content_length() [io]
+    check("POST with five bytes", server(),
+        "POST /echo HTTP/1.1\r\nHost: e\r\nContent-Length: 5\r\n\r\nhello", false,
+        "req POST /echo HTTP/1.1;Host=e;Content-Length=5 | body:hello | done")
+    check("a Content-Length of zero", server(),
+        "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n", false,
+        "req POST / HTTP/1.1;Content-Length=0 | done")
+    check("a repeated length that agrees", server(),
+        "POST / HTTP/1.1\r\nContent-Length: 2, 2\r\n\r\nok", false,
+        "req POST / HTTP/1.1;Content-Length=2, 2 | body:ok | done")
+
+@test
+fn test_a_chunked_body_with_its_trailer_section() [io]
+    // RFC 9112 section 7.1: size in hexadecimal, a line break, the
+    // data, a line break; a chunk of size zero, then trailer fields.
+    check("chunks and a trailer", server(),
+        "POST /up HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nServer-Timing: total;dur=12\r\n\r\n", false,
+        "req POST /up HTTP/1.1;Transfer-Encoding=chunked | body:Wikipedia in\r\n\r\nchunks. | trailers;Server-Timing=total;dur=12 | done")
+    check("no trailer section", server(),
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n", false,
+        "req POST / HTTP/1.1;Transfer-Encoding=chunked | body:hi | done")
+    check("a chunk extension is skipped", server(),
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;name=\"value\"\r\nhello\r\n0 ; last\r\n\r\n", false,
+        "req POST / HTTP/1.1;Transfer-Encoding=chunked | body:hello | done")
+    check("upper-case hexadecimal", server(),
+        "POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n", false,
+        "req POST / HTTP/1.1;Transfer-Encoding=Chunked | body:0123456789 | done")
+    check("lower-case hexadecimal", server(),
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n", false,
+        "req POST / HTTP/1.1;Transfer-Encoding=chunked | body:hello world | done")
+    check("line feeds without carriage returns", server(),
+        "POST / HTTP/1.1\nTransfer-Encoding: chunked\n\n2\nhi\n0\n\n", false,
+        "req POST / HTTP/1.1;Transfer-Encoding=chunked | body:hi | done")
+
+@test
+fn test_the_line_rules_h11_and_httparse_accept() [io]
+    check("empty lines before a request are ignored", server(),
+        "\r\n\r\nGET / HTTP/1.1\r\n\r\n", false,
+        "req GET / HTTP/1.1 | done")
+    check("a bare line feed ends a line", server(),
+        "GET / HTTP/1.1\nHost: e\n\n", false,
+        "req GET / HTTP/1.1;Host=e | done")
+    check("whitespace around a value is not part of it", server(),
+        "GET / HTTP/1.1\r\nHost: \t e \t\r\nX-Empty:\r\n\r\n", false,
+        "req GET / HTTP/1.1;Host=e;X-Empty= | done")
+    check("a byte from 0x80 up is a legal value byte", server(),
+        "GET / HTTP/1.1\r\nX-Name: café\r\n\r\n", false,
+        "req GET / HTTP/1.1;X-Name=café | done")
+    check("HTTP/1.0", server(),
+        "GET / HTTP/1.0\r\n\r\n", false,
+        "req GET / HTTP/1.0 | done")
+    check("an extension method", server(),
+        "PROPFIND /dav HTTP/1.1\r\n\r\n", false,
+        "req PROPFIND /dav HTTP/1.1 | done")
+    check("a lower-case method is another method", server(),
+        "get / HTTP/1.1\r\n\r\n", false,
+        "req get / HTTP/1.1 | done")
+
+@test
+fn test_pipelined_requests_come_out_in_order() [io]
+    check("two requests in one read", server(),
+        "GET /a HTTP/1.1\r\n\r\nPOST /b HTTP/1.1\r\nContent-Length: 1\r\n\r\nxGET /c HTTP/1.1\r\n\r\n", false,
+        "req GET /a HTTP/1.1 | done | req POST /b HTTP/1.1;Content-Length=1 | body:x | done | req GET /c HTTP/1.1 | done")
+
+@test
+fn test_the_start_line_refusals_name_the_byte() [io]
+    check("a method with a byte that is not a tchar", server(),
+        "G@T / HTTP/1.1\r\n\r\n", false, "error: byte 1: the method is not a token")
+    check("a request line starting with a space", server(),
+        " GET / HTTP/1.1\r\n\r\n", false, "error: byte 0: the method is not a token")
+    check("a request line with no target", server(),
+        "GET\r\n\r\n", false, "error: byte 0: the start line is not a request line or a status line")
+    check("a request line with no version", server(),
+        "GET /\r\n\r\n", false, "error: byte 5: the start line is not a request line or a status line")
+    check("HTTP/2 is another wire format", server(),
+        "GET / HTTP/2.0\r\n\r\n", false, "error: byte 6: the version is not HTTP/1.0 or HTTP/1.1")
+    check("a target with a space in it", server(),
+        "GET /a b HTTP/1.1\r\n\r\n", false, "error: byte 7: the version is not HTTP/1.0 or HTTP/1.1")
+    check("an asterisk with GET", server(),
+        "GET * HTTP/1.1\r\n\r\n", false, "error: byte 4: the request target has no shape this method may use")
+    check("an authority with GET", server(),
+        "GET www.example.com:80 HTTP/1.1\r\n\r\n", false, "error: byte 4: the request target has no shape this method may use")
+    check("a path with CONNECT", server(),
+        "CONNECT /x HTTP/1.1\r\n\r\n", false, "error: byte 8: the request target has no shape this method may use")
+    check("a fragment in a target", server(),
+        "GET /a#b HTTP/1.1\r\n\r\n", false, "error: byte 4: the request target has no shape this method may use")
+    check("two spaces", server(),
+        "GET  / HTTP/1.1\r\n\r\n", false, "error: byte 4: the request target has no shape this method may use")
+
+@test
+fn test_the_field_line_refusals_name_the_byte() [io]
+    // RFC 9112 section 5.1: no whitespace between a name and its
+    // colon.  Section 5.2: a line folded onto the one before it is
+    // refused.  Both are in h11's and httparse's suites.
+    check("a folded line", server(),
+        "GET / HTTP/1.1\r\nX: a\r\n b\r\n\r\n", false, "error: byte 22: the field name is not a token")
+    check("a space before the colon", server(),
+        "GET / HTTP/1.1\r\nHost : e\r\n\r\n", false, "error: byte 20: the field name is not a token")
+    check("a line with no colon", server(),
+        "GET / HTTP/1.1\r\nHost e\r\n\r\n", false, "error: byte 20: the field name is not a token")
+    check("a name alone", server(),
+        "GET / HTTP/1.1\r\nHost\r\n\r\n", false, "error: byte 20: the field name is not a token")
+    check("an empty name", server(),
+        "GET / HTTP/1.1\r\n: e\r\n\r\n", false, "error: byte 16: the field name is not a token")
+    check("a carriage return inside a value", server(),
+        "GET / HTTP/1.1\r\nX: a\rb\r\n\r\n", false, "error: byte 20: the field value holds a control character")
+    check("a delete inside a value", server(),
+        "GET / HTTP/1.1\r\nX: a\u{7f}b\r\n\r\n", false, "error: byte 20: the field value holds a control character")
+
+@test
+fn test_the_framing_refusals() [io]
+    check("both framing headers", server(),
+        "POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n", false,
+        "error: byte 0: the message is framed two ways at once")
+    check("a length that is not digits", server(),
+        "POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n", false,
+        "error: byte 0: Content-Length \"+5\" is not one length")
+    check("two lengths that disagree", server(),
+        "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n", false,
+        "error: byte 0: Content-Length \"5, 6\" is not one length")
+    check("an empty element in a length list", server(),
+        "POST / HTTP/1.1\r\nContent-Length: 5,\r\n\r\n", false,
+        "error: byte 0: Content-Length \"5,\" is not one length")
+    check("a length of nineteen digits", server(),
+        "POST / HTTP/1.1\r\nContent-Length: 1234567890123456789\r\n\r\n", false,
+        "error: byte 0: Content-Length \"1234567890123456789\" is not one length")
+    check("a coding this package does not apply", server(),
+        "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", false,
+        "error: byte 0: transfer coding \"gzip\" is not chunked")
+    check("chunked twice", server(),
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n", false,
+        "error: byte 0: the message is framed two ways at once")
+    check("an empty coding list", server(),
+        "POST / HTTP/1.1\r\nTransfer-Encoding: ,\r\n\r\n", false,
+        "error: byte 0: transfer coding \"\" is not chunked")
+    check("the offset is where the head started", server(),
+        "GET / HTTP/1.1\r\n\r\nPOST / HTTP/1.1\r\nContent-Length: x\r\n\r\n", false,
+        "error: byte 18: Content-Length \"x\" is not one length")
+
+@test
+fn test_the_chunk_refusals() [io]
+    // The head below is 47 bytes long, so the first chunk-size line
+    // starts at byte 47.
+    let head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    check("a size that is not hexadecimal", server(), head + "zz\r\n", false,
+        "error: byte 47: the chunk size is not hexadecimal")
+    check("text after the size", server(), head + "5 x\r\nhello\r\n", false,
+        "error: byte 49: the chunk size is not hexadecimal")
+    check("a control character in an extension", server(), head + "5;a\u{1}\r\nhello\r\n", false,
+        "error: byte 50: the chunk size is not hexadecimal")
+    check("data not followed by a line break", server(), head + "5\r\nhelloXY", false,
+        "error: byte 55: the chunk data is not followed by a line break")
+    check("a carriage return not followed by a line feed", server(), head + "5\r\nhello\rX", false,
+        "error: byte 55: the chunk data is not followed by a line break")
+    check("a trailer RFC 9110 forbids", server(), head + "0\r\nContent-Length: 5\r\n\r\n", false,
+        "error: byte 50: \"Content-Length\" may not be a trailer field")
+    check("a trailer line with no colon", server(), head + "0\r\nnot a field\r\n\r\n", false,
+        "error: byte 50: \"not\" may not be a trailer field")
+    check("a trailer value with a control character", server(), head + "0\r\nX: a\u{1}\r\n\r\n", false,
+        "error: byte 54: \"X\" may not be a trailer field")
+
+@test
+fn test_the_limits_are_enforced() [io]
+    let small = H1Limits { max_head: 64, max_headers: 2, max_chunk: 16 }
+    let r = h1read.reader(ReadsRequests, small)
+    check("a head past max_head with no blank line", r,
+        "GET / HTTP/1.1\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false,
+        "error: byte 64: the head is longer than 64 bytes")
+    check("a whole head past max_head", r,
+        "GET / HTTP/1.1\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n", false,
+        "error: byte 64: the head is longer than 64 bytes")
+    check("more fields than max_headers", r,
+        "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n", false,
+        "error: byte 28: more than 2 fields")
+    check("a chunk past max_chunk", r,
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n11\r\n", false,
+        "error: byte 47: the chunk is longer than 16 bytes")
+    check("a chunk-size line past max_head", r,
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false,
+        "error: byte 47: the chunk size is not hexadecimal")
+    check("a trailer section past max_head", r,
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false,
+        "error: byte 114: the head is longer than 64 bytes")
+    check("a whole trailer section past max_head", r,
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n", false,
+        "error: byte 114: the head is longer than 64 bytes")
+    check("more trailers than max_headers", r,
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n", false,
+        "error: byte 62: more than 2 fields")
+
+@test
+fn test_a_close_inside_a_message_is_a_truncation_at_its_last_byte() [io]
+    let chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    check("inside a head", server(), "GET / HT", true,
+        "error: byte 8: the connection closed inside a message")
+    check("inside a fixed-length body", server(),
+        "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc", true,
+        "error: byte 42: the connection closed inside a message")
+    check("inside a chunk-size line", server(), chunked + "5", true,
+        "error: byte 48: the connection closed inside a message")
+    check("before the line break after chunk data", server(), chunked + "2\r\nhi\r", true,
+        "error: byte 53: the connection closed inside a message")
+    check("inside a trailer section", server(), chunked + "0\r\nX: 1", true,
+        "error: byte 54: the connection closed inside a message")
+    check("between messages is not a truncation", server(),
+        "GET / HTTP/1.1\r\n\r\n\r\n", true,
+        "req GET / HTTP/1.1 | done")
+
+@test
+fn test_responses_frame_by_the_method_they_answer() [io]
+    check("a 200 with a length", client([Get]),
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", false,
+        "resp HTTP/1.1 200 OK;Content-Length=5 | body:hello | done")
+    check("the answer to HEAD carries no body", client([Head, Get]),
+        "HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n", false,
+        "resp HTTP/1.1 200 OK;Content-Length=1024 | done | resp HTTP/1.1 204 No Content | done")
+    check("a 100 Continue and then the final response", client([Post]),
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n", false,
+        "resp HTTP/1.1 100 Continue | done | resp HTTP/1.1 201 Created;Content-Length=0 | done")
+    check("a body framed by the close", client([Get]),
+        "HTTP/1.0 200 OK\r\n\r\nall of it", true,
+        "resp HTTP/1.0 200 OK | body:all of it | done")
+    check("a chunked response", client([Get]),
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nETag: \"x\"\r\n\r\n", false,
+        "resp HTTP/1.1 200 OK;Transfer-Encoding=chunked | body:abc | trailers;ETag=\"x\" | done")
+    check("a 2xx answer to CONNECT is a tunnel", client([Connect]),
+        "HTTP/1.1 200 Connection Established\r\n\r\n", false,
+        "resp HTTP/1.1 200 Connection Established | done")
+    check("a 101 answers its request", client([Get, Get]),
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n", false,
+        "resp HTTP/1.1 101 Switching Protocols;Upgrade=websocket | done")
+
+@test
+fn test_a_status_line_may_omit_its_reason_phrase() [io]
+    check("no space and no reason", client([Get]),
+        "HTTP/1.1 204\r\n\r\n", false, "resp HTTP/1.1 204  | done")
+    check("a space and an empty reason", client([Get]),
+        "HTTP/1.1 204 \r\n\r\n", false, "resp HTTP/1.1 204  | done")
+
+@test
+fn test_the_status_line_refusals() [io]
+    check("a status past 599", client([Get]),
+        "HTTP/1.1 600 Nope\r\n\r\n", false, "error: byte 8: the status is not three digits from 100 to 599")
+    check("two digits", client([Get]),
+        "HTTP/1.1 20 OK\r\n\r\n", false, "error: byte 8: the status is not three digits from 100 to 599")
+    check("four digits", client([Get]),
+        "HTTP/1.1 2000 OK\r\n\r\n", false, "error: byte 8: the status is not three digits from 100 to 599")
+    check("a letter in the status", client([Get]),
+        "HTTP/1.1 2x0 OK\r\n\r\n", false, "error: byte 8: the status is not three digits from 100 to 599")
+    check("no status at all", client([Get]),
+        "HTTP/1.1\r\n\r\n", false, "error: byte 8: the status is not three digits from 100 to 599")
+    check("HTTP/2", client([Get]),
+        "HTTP/2 200\r\n\r\n", false, "error: byte 0: the version is not HTTP/1.0 or HTTP/1.1")
+    check("not a status line", client([Get]),
+        "HTTX/1.1 200 OK\r\n\r\n", false, "error: byte 3: the start line is not a request line or a status line")
+    check("a control character in the reason", client([Get]),
+        "HTTP/1.1 200 O\u{1}K\r\n\r\n", false, "error: byte 14: the start line is not a request line or a status line")
+    check("a response nobody asked for", client([]),
+        "HTTP/1.1 200 OK\r\n\r\n", false,
+        "error: byte 0: a response arrived before the reader was told which request it answers")
+
+@test
+fn test_a_body_after_a_response_that_may_not_have_one_is_named() [io]
+    check("bytes after a 304", client([Get]),
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\nhello", false,
+        "error: byte 48: a body follows a 304 response that may not have one")
+    check("bytes after the answer to HEAD", client([Head]),
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", false,
+        "error: byte 38: a body follows a 200 response that may not have one")
+
+@test
+fn test_the_offset_counts_every_byte_the_reader_was_given() [io]
+    test.case("offset after a whole request with a body")
+    let d = read_in_pieces(server(), wire("POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi"), 4, false)!
+    test.assert_eq_str(summary(d), "req POST / HTTP/1.1;Content-Length=2 | body:hi | done")
+    let step = h1read.feed(server(), wire("POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi"))!
+    let all = take_all(step.reader, [])!
+    test.assert(h1read.offset(all.reader) == 40)
+    test.assert(h1read.pending_len(all.reader) == 0)
+    test.assert(not h1read.message_open(all.reader))
+
+@test
+fn test_drain_reads_one_message_and_keeps_the_rest() [io]
+    test.case("two requests in the source, one drained")
+    let src = Buffer.from_str("GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n")
+    let d = h1read.drain(server(), src)!
+    test.assert_eq_str(summary(d.events), "req GET /a HTTP/1.1 | done")
+    test.assert(h1read.pending_len(d.reader) == 19)
+    let second = h1read.drain(d.reader, src)!
+    test.assert_eq_str(summary(second.events), "req GET /b HTTP/1.1 | done")
+    src.drop()
+
+    test.case("a body framed by the close ends when the source does")
+    let body = Buffer.from_str("HTTP/1.1 200 OK\r\n\r\nuntil the end")
+    let got = h1read.drain(client([Get]), body)!
+    test.assert_eq_str(summary(got.events), "resp HTTP/1.1 200 OK | body:until the end | done")
+    body.drop()
+
+    test.case("a source that ends between messages gives nothing")
+    let empty = Buffer.from_str("")
+    let none = h1read.drain(server(), empty)!
+    test.assert(list.len(none.events) == 0)
+    empty.drop()
+
+    test.case("a source that ends inside a message is a truncation")
+    let cut = Buffer.from_str("GET / HTTP/1.1\r\nHost")
+    match h1read.drain(server(), cut)
+        Ok(_)  => test.fail("the head never ended")
+        Err(e) => test.assert(h1err.offset_of(e) == 20)
+    cut.drop()
+
+@test
+fn test_parse_head_answers_the_head_and_no_framing() [io]
+    test.case("a response head needs no expected method")
+    let raw = wire("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+    let step = h1read.parse_head(raw, ReadsResponses, h1read.default_limits())!
+    match step.event
+        Some(ResponseHead(resp)) => test.assert(resp.status == 200)
+        _                        => test.fail("a response head")
+    test.assert(h1read.offset(step.reader) == 38)
+    test.assert(not h1read.message_open(step.reader))
+
+    test.case("a request head with a body after it")
+    let req = h1read.parse_head(wire("PUT /x HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc"),
+        ReadsRequests,
+        h1read.default_limits())!
+    test.assert(h1read.offset(req.reader) == 38)
+
+    test.case("part of a head is not yet a head")
+    let part = h1read.parse_head(wire("GET / HTTP/1.1\r\n"), ReadsRequests, h1read.default_limits())!
+    test.assert(part.event == None)

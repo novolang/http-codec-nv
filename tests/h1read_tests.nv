@@ -1,31 +1,19 @@
-// tests/h1read_tests.nv — the API tests for the reader, written
-// against the signatures.
+// tests/h1read_tests.nv — the reader's calls, one at a time.
 //
-// They COMPILE today and they FAIL at run with `not implemented`.  Two
-// of them assert something the compiler has ALREADY decided by the time
-// the run starts, and those two are the ones worth reading:
-// `test_drain_over_a_buffer_costs_nothing` would not compile if
-// `drain`'s row had spent an effect instead of binding one, and
-// `test_a_reader_is_told_the_method_it_answers` would not compile if
-// `expect` were not on the reader.
+// `test_drain_over_a_buffer_costs_nothing` is also checked by the
+// compiler: it would not compile if `drain` declared an effect of its
+// own instead of binding the source's.
 
 use std.test
+use std.bytes
 use h1read
 use h1msg
 use h1err
 
-// `GET / HTTP/1.1\r\nHost: e\r\n\r\n` as bytes, which is the smallest
-// complete request there is.
+// `GET / HTTP/1.1\r\nHost: e\r\n\r\n`, the smallest complete request
+// there is: 27 bytes.
 fn a_get_on_the_wire() -> [u8]
-    [0x47 as u8, 0x45 as u8, 0x54 as u8, 0x20 as u8,
-     0x2F as u8, 0x20 as u8,
-     0x48 as u8, 0x54 as u8, 0x54 as u8, 0x50 as u8,
-     0x2F as u8, 0x31 as u8, 0x2E as u8, 0x31 as u8,
-     0x0D as u8, 0x0A as u8,
-     0x48 as u8, 0x6F as u8, 0x73 as u8, 0x74 as u8,
-     0x3A as u8, 0x20 as u8, 0x65 as u8,
-     0x0D as u8, 0x0A as u8,
-     0x0D as u8, 0x0A as u8]
+    bytes.to_byte_list(bytes.from_str("GET / HTTP/1.1\r\nHost: e\r\n\r\n"))
 
 fn a_server_reader() -> H1Reader
     h1read.reader(ReadsRequests, h1read.default_limits())
@@ -40,10 +28,9 @@ fn test_a_fresh_reader_holds_nothing_and_has_consumed_nothing() [io]
 
 @test
 fn test_a_prefix_is_not_an_event_and_not_an_error() [io]
-    // The distinction the package is built on: "wait for more bytes" is
-    // `event: None`, and it is not a variant of `H1DecodeError`.
+    // Waiting for more bytes is `event: None`, not an `H1DecodeError`.
     test.case("three bytes of a request line")
-    match h1read.feed(a_server_reader(), [0x47 as u8, 0x45 as u8, 0x54 as u8])
+    match h1read.feed(a_server_reader(), ['G' as u8, 'E' as u8, 'T' as u8])
         Err(_)   => test.fail("an incomplete head is not malformed")
         Ok(step) =>
             match step.event
@@ -52,23 +39,14 @@ fn test_a_prefix_is_not_an_event_and_not_an_error() [io]
 
 @test
 fn test_a_whole_request_comes_out_as_a_head_then_an_end() [io]
-    // THE MATCH IS SPLIT IN TWO ON PURPOSE.  The shape this wanted is
-    // `match first.event { Some(RequestHead(req)) => req.target … }`,
-    // and a binding introduced two constructors deep is an E6000
-    // internal compiler error today
-    // (`a-struct-bound-two-constructors-deep-in-a-match-pattern-is-an-ice`,
-    // filed from this lane).  Nothing in the package changed for it —
-    // the defect is in reading the result, not in the interface.
     test.case("the head")
     let first = h1read.feed(a_server_reader(), a_get_on_the_wire())!
     match first.event
-        None     => test.fail("that is a whole request")
-        Some(ev) =>
-            match ev
-                RequestHead(req) =>
-                    test.assert(h1msg.method_token(req.method) == "GET")
-                    test.assert(req.target == "/")
-                _                => test.fail("a server's reader produces request heads")
+        Some(RequestHead(req)) =>
+            test.assert(h1msg.method_token(req.method) == "GET")
+            test.assert(req.target == "/")
+        Some(_)                => test.fail("a server's reader produces request heads")
+        None                   => test.fail("that is a whole request")
 
     test.case("and the end, since a GET with no framing header has no body")
     let second = h1read.take(first.reader)!
@@ -79,11 +57,7 @@ fn test_a_whole_request_comes_out_as_a_head_then_an_end() [io]
 
 @test
 fn test_one_feed_drains_one_event_and_take_gets_the_rest() [io]
-    // The contract `feed` shares with hci-codec-nv's: a feed that
-    // completes three events hands back one and keeps two, because a
-    // function that returned a list would have to allocate one on every
-    // call including the overwhelmingly common one that completes
-    // nothing.
+    // A feed that completes two events answers one and keeps the other.
     test.case("feed then take")
     let step = h1read.feed(a_server_reader(), a_get_on_the_wire())!
     test.assert(h1read.message_open(step.reader))
@@ -122,11 +96,8 @@ fn test_a_refusal_carries_the_byte_it_stopped_at() [io]
 
 @test
 fn test_a_reader_is_told_the_method_it_answers() [io]
-    // ASSERTED BY THE COMPILER as much as by the run: `expect` takes a
-    // reader and gives one back, so a client's method queue lives in
-    // the reader rather than in every caller.  A signature that had put
-    // the method on `feed` instead would have made a pipelining client
-    // pass the same value three times and get the order wrong once.
+    // `expect` answers a reader, so the queue of sent methods lives in
+    // the reader and not in the caller.
     test.case("expect")
     let r = h1read.expect(h1read.reader(ReadsResponses, h1read.default_limits()), Head)
     test.assert(h1read.offset(r) == 0)
@@ -144,7 +115,7 @@ fn test_a_close_between_messages_is_not_a_truncation() [io]
 @test
 fn test_a_close_inside_a_message_is_a_truncation() [io]
     test.case("finish mid-head")
-    let step = h1read.feed(a_server_reader(), [0x47 as u8, 0x45 as u8, 0x54 as u8])!
+    let step = h1read.feed(a_server_reader(), ['G' as u8, 'E' as u8, 'T' as u8])!
     match h1read.finish(step.reader)
         Ok(_)  => test.fail("half a request line is not a request")
         Err(e) =>
@@ -174,14 +145,9 @@ fn test_the_two_named_limit_sets_differ_by_orders_of_magnitude() [io]
 
 @test
 fn test_drain_over_a_buffer_costs_nothing() [io]
-    // THE CLAIM THIS PACKAGE'S `core` LAYER RESTS ON, and the compiler
-    // has already decided it by the time this runs.  `drain<S: Read[e]>`
-    // binds the standard library's `Read` effect parameter;
-    // `impl Read[] for Buffer` supplies nothing; so this function's row
-    // is `[io]` for the `println` in `test.fail` alone.  Had `drain`
-    // spent an effect instead of binding one — `[io, net]`, say,
-    // because "it reads a socket" — this file would not compile, and
-    // that refusal is the assertion.
+    // `drain<S: Read[e]>` binds the effect parameter of the standard
+    // library's `Read`, and `impl Read[] for Buffer` supplies none, so
+    // this function's `[io]` is for the test calls alone.
     test.case("drain over an in-memory Buffer")
     let src = Buffer.from_str("GET / HTTP/1.1\r\nHost: e\r\n\r\n")
     match h1read.drain(a_server_reader(), src)

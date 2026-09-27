@@ -1,0 +1,66 @@
+// tests/h1err_tests.nv — the refusals: their offsets, their messages,
+// and the status a server answers each with.
+
+use std.test
+use std.str
+use h1err
+
+// Every decode refusal, each at a different offset.
+fn every_decode_error() -> [H1DecodeError]
+    [BadStartLine(1), BadMethodToken(2), BadTargetForm(3), BadHttpVersion(4),
+     BadStatusCode(5), BadHeaderName(6), BadHeaderValue(7), HeadTooLarge(8, 64),
+     TooManyHeaders(9, 16), BadContentLength(10, "x"), ConflictingFraming(11),
+     UnsupportedTransferCoding(12, "gzip"), BadChunkSize(13), ChunkTooLarge(14, 512),
+     BadChunkTerminator(15), BadTrailer(16, "Host"), MessageTruncated(17),
+     BodyNotAllowed(18, 204), MessageStillOpen(19)]
+
+@test
+fn test_every_decode_refusal_carries_its_offset() [io]
+    test.case("offset_of over every variant")
+    var want = 1
+    for e in every_decode_error()
+        test.assert(h1err.offset_of(e) == want)
+        want = want + 1
+
+@test
+fn test_every_decode_message_starts_with_its_byte() [io]
+    test.case("message over every variant")
+    var at = 1
+    for e in every_decode_error()
+        test.assert(str.starts_with(e.message(), "byte ${at}: "))
+        at = at + 1
+    test.assert_eq_str(HeadTooLarge(8, 64).message(), "byte 8: the head is longer than 64 bytes")
+    test.assert_eq_str(BadContentLength(10, "x").message(), "byte 10: Content-Length \"x\" is not one length")
+    test.assert_eq_str(BodyNotAllowed(18, 204).message(),
+        "byte 18: a body follows a 204 response that may not have one")
+
+@test
+fn test_the_status_a_server_answers_each_refusal_with() [io]
+    test.case("431 for a head or a section that is too large")
+    test.assert((h1err.status_for(HeadTooLarge(0, 1)) ?? 0) == 431)
+    test.assert((h1err.status_for(TooManyHeaders(0, 1)) ?? 0) == 431)
+
+    test.case("501 for a transfer coding the server does not apply")
+    test.assert((h1err.status_for(UnsupportedTransferCoding(0, "gzip")) ?? 0) == 501)
+
+    test.case("400 for every other fault in a request")
+    test.assert((h1err.status_for(BadHeaderValue(3)) ?? 0) == 400)
+    test.assert((h1err.status_for(ConflictingFraming(3)) ?? 0) == 400)
+
+    test.case("nobody to answer")
+    test.assert(h1err.status_for(MessageTruncated(0)) == None)
+    test.assert(h1err.status_for(BodyNotAllowed(0, 204)) == None)
+    test.assert(h1err.status_for(MessageStillOpen(0)) == None)
+
+@test
+fn test_every_encode_refusal_has_a_message() [io]
+    test.case("message over every variant")
+    let all = [BodyForbiddenForStatus(204), BodyForbiddenForHead, FramingConflictToWrite,
+        BadHeaderNameToWrite("X Y"), BadHeaderValueToWrite("Location"),
+        BadMethodTokenToWrite("G T"), BadStatusCodeToWrite(99), MissingHost,
+        LengthDisagreesWithBody(3, 2), BadTargetToWrite("/a b"),
+        BadReasonToWrite("O\nK"), EmptyChunkToWrite, ForbiddenTrailerToWrite("Host")]
+    for e in all
+        test.assert(str.len(e.message()) > 0)
+    test.assert_eq_str(LengthDisagreesWithBody(3, 2).message(), "Content-Length says 3 and the body is 2 bytes")
+    test.assert_eq_str(BadHeaderNameToWrite("X Y").message(), "field name \"X Y\" is not a token")

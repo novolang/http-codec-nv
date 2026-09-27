@@ -1,11 +1,5 @@
-// tests/h1msg_tests.nv — the API tests for the message types and the
-// framing rules, written against the signatures.
-//
-// They COMPILE today and they FAIL at run, with `not implemented:
-// http-codec-nv.h1msg.<fn>` from the `todo()` that is each body.  That
-// is the expected state of an interface release: the compiler has
-// checked every signature, every type and every effect row, and nothing
-// else has been checked because there is nothing else yet.
+// tests/h1msg_tests.nv — the header section, the methods, the target
+// forms, and the rules that frame a body and end a connection.
 
 use std.test
 use h1msg
@@ -35,10 +29,8 @@ fn test_a_field_name_compares_without_case_and_only_in_ascii() [io]
 
 @test
 fn test_lookup_ignores_case_and_storage_keeps_it() [io]
-    // The two halves of the header design, asserted together because
-    // separating them is exactly the mistake: a section that answered
-    // `get` correctly by lower-casing on the way in would pass the
-    // first assertion and fail the second.
+    // Both halves together: a section that lower-cased names on the
+    // way in would pass the first assertion and fail the second.
     test.case("case-insensitive lookup over verbatim storage")
     let h = h1msg.headers([H1Header { name: "Content-Type", value: "text/plain" }])
     match h1msg.get(h, "content-type")
@@ -153,9 +145,8 @@ fn test_a_request_with_neither_framing_header_has_no_body() [io]
 
 @test
 fn test_both_framing_headers_at_once_are_refused() [io]
-    // The request-smuggling defence, as an assertion.  A codec that
-    // preferred one over the other would disagree with the next hop
-    // about where this message ends, which is the whole bug.
+    // RFC 9112 section 6.1.  Two hops that each preferred a different
+    // header would disagree about where the message ends.
     test.case("Content-Length beside Transfer-Encoding")
     let req = H1Request {
         method: Post,
@@ -174,9 +165,8 @@ fn test_both_framing_headers_at_once_are_refused() [io]
 
 @test
 fn test_a_response_to_head_has_no_body_however_long_it_says_it_is() [io]
-    // The oldest bug in HTTP client code, as an assertion.  The
-    // Content-Length is real and the bytes are not, and a client that
-    // framed on the header alone waits forever.
+    // RFC 9110 section 9.3.2: the Content-Length is the one a GET would
+    // have had, and no bytes follow.
     test.case("HEAD")
     match h1msg.response_framing(Head, an_ok("1024"))
         Ok(NoBody) => test.assert(true)
@@ -273,3 +263,127 @@ fn test_a_status_has_the_reason_phrase_the_registry_gives_it() [io]
     test.case("status_reason")
     test.assert(h1msg.status_reason(404) == "Not Found")
     test.assert(h1msg.status_reason(599) == "")
+
+@test
+fn test_every_registered_method_round_trips() [io]
+    test.case("method_of and method_token are inverses")
+    for token in ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "M-SEARCH"]
+        match h1msg.method_of(token)
+            Some(m) => test.assert_eq_str(h1msg.method_token(m), token)
+            None    => test.fail("every one of these is a token")
+
+@test
+fn test_the_edges_of_the_target_forms() [io]
+    test.case("no scheme, no path")
+    test.assert(h1msg.target_form("?q", Get) == None)
+    test.assert(h1msg.target_form("http", Get) == None)
+    test.assert(h1msg.target_form("http:x", Get) == None)
+    test.assert(h1msg.target_form("", Get) == None)
+
+    test.case("an absolute-form target is legal with CONNECT's neighbours")
+    test.assert(h1msg.target_form("https://e.org/", Options) == Some(AbsoluteForm))
+
+    test.case("authority-form: a port of digits, and a bracketed literal")
+    test.assert(h1msg.target_form("e.org:4x3", Connect) == None)
+    test.assert(h1msg.target_form("e.org:", Connect) == None)
+    test.assert(h1msg.target_form(":443", Connect) == None)
+    test.assert(h1msg.target_form("e.org", Connect) == None)
+    test.assert(h1msg.target_form("[::1:443", Connect) == None)
+    test.assert(h1msg.target_form("e.org/x:443", Connect) == None)
+    test.assert(h1msg.target_form("user@e.org:443", Connect) == None)
+    test.assert(h1msg.target_form("a:b:443", Connect) == None)
+    test.assert(h1msg.target_form("[::1]:443", Connect) == Some(AuthorityForm))
+    test.assert(h1msg.target_form("192.0.2.1:8080", Connect) == Some(AuthorityForm))
+
+@test
+fn test_the_edges_of_a_field_value() [io]
+    test.case("empty is legal")
+    test.assert(h1msg.is_field_value(""))
+    test.case("whitespace at either end is not")
+    test.assert(not h1msg.is_field_value(" a"))
+    test.assert(not h1msg.is_field_value("a\t"))
+    test.case("inside it is")
+    test.assert(h1msg.is_field_value("a \t b"))
+    test.assert(h1msg.is_field_value("café"))
+
+@test
+fn test_a_connection_list_is_read_as_tokens() [io]
+    test.case("close among other tokens, in any case, with whitespace")
+    let h = h1msg.headers([H1Header { name: "connection", value: "Upgrade , CLOSE ," }])
+    test.assert(h1msg.wants_close(Http11, h))
+
+    test.case("HTTP/1.0 that asked to keep the connection")
+    let keep = h1msg.headers([H1Header { name: "Connection", value: "keep-alive" }])
+    test.assert(not h1msg.wants_close(Http10, keep))
+
+@test
+fn test_the_rules_that_end_a_connection_after_an_exchange() [io]
+    test.case("an upgrade")
+    let switching = H1Response {
+        version: Http11, status: 101, reason: "Switching Protocols",
+        headers: h1msg.headers([H1Header { name: "Upgrade", value: "websocket" }]) }
+    test.assert(not h1msg.may_reuse(a_get(), switching))
+
+    test.case("a body framed by the close")
+    let unframed = H1Response { version: Http11, status: 200, reason: "OK", headers: h1msg.no_headers() }
+    test.assert(not h1msg.may_reuse(a_get(), unframed))
+
+    test.case("a response that cannot be framed")
+    test.assert(not h1msg.may_reuse(a_get(), an_ok("nope")))
+
+    test.case("the client asked to close")
+    let closing = H1Request {
+        method: Get, target: "/", version: Http11,
+        headers: h1msg.headers([H1Header { name: "Connection", value: "close" }]) }
+    test.assert(not h1msg.may_reuse(closing, an_ok("3")))
+
+    test.case("a 2xx answer to CONNECT is a tunnel")
+    test.assert(h1msg.is_upgrade(Connect, an_ok("0")))
+    test.assert(not h1msg.is_upgrade(Connect, H1Response { version: Http11, status: 407, reason: "", headers: h1msg.no_headers() }))
+
+@test
+fn test_response_framing_follows_rfc_9112_section_6_3() [io]
+    test.case("chunked")
+    let chunked = H1Response { version: Http11, status: 200, reason: "OK",
+        headers: h1msg.headers([H1Header { name: "Transfer-Encoding", value: "chunked" }]) }
+    test.assert(h1msg.response_framing(Get, chunked) == Ok(ChunkedBody))
+
+    test.case("neither header is until close")
+    let bare = H1Response { version: Http11, status: 200, reason: "OK", headers: h1msg.no_headers() }
+    test.assert(h1msg.response_framing(Get, bare) == Ok(UntilClose))
+
+    test.case("a 2xx answer to CONNECT has no body")
+    test.assert(h1msg.response_framing(Connect, an_ok("5")) == Ok(NoBody))
+
+    test.case("a request with chunked coding")
+    let up = H1Request { method: Put, target: "/f", version: Http11,
+        headers: h1msg.headers([H1Header { name: "Transfer-Encoding", value: "chunked" }]) }
+    test.assert(h1msg.request_framing(up) == Ok(ChunkedBody))
+
+@test
+fn test_every_status_rfc_9110_names_has_its_reason_phrase() [io]
+    test.case("the section 15 table")
+    let table = [
+        (100, "Continue"), (101, "Switching Protocols"), (102, "Processing"), (103, "Early Hints"),
+        (200, "OK"), (201, "Created"), (202, "Accepted"), (203, "Non-Authoritative Information"),
+        (204, "No Content"), (205, "Reset Content"), (206, "Partial Content"), (207, "Multi-Status"),
+        (208, "Already Reported"), (226, "IM Used"),
+        (300, "Multiple Choices"), (301, "Moved Permanently"), (302, "Found"), (303, "See Other"),
+        (304, "Not Modified"), (305, "Use Proxy"), (307, "Temporary Redirect"), (308, "Permanent Redirect"),
+        (400, "Bad Request"), (401, "Unauthorized"), (402, "Payment Required"), (403, "Forbidden"),
+        (404, "Not Found"), (405, "Method Not Allowed"), (406, "Not Acceptable"),
+        (407, "Proxy Authentication Required"), (408, "Request Timeout"), (409, "Conflict"),
+        (410, "Gone"), (411, "Length Required"), (412, "Precondition Failed"),
+        (413, "Content Too Large"), (414, "URI Too Long"), (415, "Unsupported Media Type"),
+        (416, "Range Not Satisfiable"), (417, "Expectation Failed"), (421, "Misdirected Request"),
+        (422, "Unprocessable Content"), (423, "Locked"), (424, "Failed Dependency"),
+        (425, "Too Early"), (426, "Upgrade Required"), (428, "Precondition Required"),
+        (429, "Too Many Requests"), (431, "Request Header Fields Too Large"),
+        (451, "Unavailable For Legal Reasons"),
+        (500, "Internal Server Error"), (501, "Not Implemented"), (502, "Bad Gateway"),
+        (503, "Service Unavailable"), (504, "Gateway Timeout"), (505, "HTTP Version Not Supported"),
+        (506, "Variant Also Negotiates"), (507, "Insufficient Storage"), (508, "Loop Detected"),
+        (511, "Network Authentication Required"), (418, ""), (306, "")]
+    for row in table
+        let (code, phrase) = row
+        test.assert_eq_str(h1msg.status_reason(code), phrase)
