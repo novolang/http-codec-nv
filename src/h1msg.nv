@@ -1,59 +1,40 @@
-// h1msg.nv — an HTTP/1.1 message as values, and the framing rules that
+// h1msg.nv — an HTTP/1.1 message head as values, and the rules that
 // decide how long its body is.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A head is the start line and the header section of a message (RFC
+// 9112 section 2.1).  `H1Request` and `H1Response` are heads and carry
+// no body.  A body arrives as a series of `BodyBytes` events from
+// `h1read`, so a message of any size can pass through without being
+// held in memory.
 //
-// WHY THE TYPES ARE NAMED `H1…`
+// Framing is how a recipient knows where a body ends.  It is computed
+// from the head by `request_framing` and `response_framing` rather
+// than stored on it, because the same response head frames differently
+// depending on the method of the request it answers.
 //
-// The standard library already owns `HttpRequest`, `HttpResponse` and
-// `HttpHeader` — they are `std.http`'s client and server types — and a
-// public type name is unique across a whole assembly, not per package
-// (`docs/publishing.md` § Public type names are globally unique).  `H1`
-// is what the reference implementations call this wire format when they
-// have to distinguish it from HTTP/2 (h11, h2, `curl --http1.1`), so
-// the prefix says something true rather than only avoiding a clash:
-// these types are HTTP/1.1's, and an HTTP/2 codec would bring its own.
-//
-// WHAT A HEAD IS, AND WHAT IT IS NOT
-//
-// `H1Request` and `H1Response` are HEADS.  Neither carries a body, and
-// that is the single most load-bearing decision in the package: a body
-// arrives as a series of `BodyBytes` events over as long as the peer
-// takes to send it, and a struct that had a `body: [u8]` field would
-// have forced this package to buffer a whole upload before handing
-// anything back.  A 4 GB PUT is a normal thing for a person to do and
-// an embedded consumer has 64 KB of RAM; the head/body split is what
-// lets both work.
-//
-// The framing is therefore a separate question with its own answer:
-// `request_framing` and `response_framing` compute, from the head,
-// exactly how many body bytes are due and how they are delimited.  It
-// is a function rather than a field because it depends on things the
-// head does not contain — the method of the request a response is
-// answering, most importantly, since a response to HEAD has the
-// Content-Length of the body it does not send.
+// The types are named `H1…` because the standard library's `std.http`
+// already declares `HttpRequest`, `HttpResponse` and `HttpHeader`, and
+// a public type name is unique across a whole program.
+
+use std.str
+use h1err
 
 // H1Version is the two HTTP versions this wire format has.
 //
-// `HTTP/0.9` is not here: it has no headers, no status line and no
-// version token, so a parser for it is a different parser.  `HTTP/2`
-// and `HTTP/3` are not here either — they are different wire formats
-// that happen to share a semantics, and `h1err.BadHttpVersion` is what
-// a reader answers when it meets one.
+// HTTP/0.9 has no headers and no status line, so it is a different
+// parser.  HTTP/2 and HTTP/3 are different wire formats, and a reader
+// that meets one answers `BadHttpVersion`.
 pub enum H1Version
     Http10
     Http11
 
-// H1Method is a request method: the nine RFC-registered ones by name,
-// and everything else as its token.
+// H1Method is a request method: the nine registered in RFC 9110
+// section 9 and RFC 5789 by name, and any other token as
+// `ExtensionMethod`.
 //
-// `ExtensionMethod` is not a fallback for a typo.  WebDAV, CalDAV and
-// every private API in the world register methods, RFC 9110 § 9 says
-// the list is open, and a codec that refused what it did not recognise
-// would be a codec you cannot proxy through.  What it does NOT do is
-// case-fold: HTTP methods are case-sensitive, so `get` arrives as
-// `ExtensionMethod("get")` if it is a legal token at all, and a server
-// that wanted to accept it has to say so itself.
+// Method names are case-sensitive (RFC 9110 section 9.1).  `get` is a
+// legal token, so it arrives as `ExtensionMethod("get")` and not as
+// `Get`.
 pub enum H1Method
     Get
     Head
@@ -66,105 +47,77 @@ pub enum H1Method
     Patch
     ExtensionMethod(token: Str)
 
-// H1TargetForm is which of RFC 9112 § 3.2's four shapes a request
-// target has.
+// H1TargetForm is which of the four shapes of RFC 9112 section 3.2 a
+// request target has.
 //
-// The form is not decoration: a server must refuse an authority-form
-// target on anything but CONNECT and an asterisk-form on anything but
-// OPTIONS, and a target that arrives in absolute-form overrides the
-// `Host` header.  Those are three rules a caller gets wrong by not
-// knowing which form it is holding, so this package answers the
-// question rather than leaving it in prose.
+// An authority-form target is legal only with CONNECT and an
+// asterisk-form target only with OPTIONS.  An absolute-form target
+// takes the place of the `Host` header.
 pub enum H1TargetForm
-    // `/where?q=now` — the ordinary one.
+    // `/where?q=now`: an absolute path and an optional query.
     OriginForm
-    // `http://example.org/where` — a proxy request, and what a
-    // conforming server must also accept directly.
+    // `http://example.org/where`: a whole URI, sent to a proxy.
     AbsoluteForm
-    // `example.org:443` — CONNECT, and only CONNECT.
+    // `example.org:443`: a host and a port, for CONNECT.
     AuthorityForm
-    // `*` — a server-wide OPTIONS, and only OPTIONS.
+    // `*`: the server as a whole, for OPTIONS.
     AsteriskForm
 
-// H1Header is one header field, in the case it arrived in.
+// H1Header is one header field, with its name in the case it was
+// written in.
 //
-// The original case is kept for a reason that is easy to argue away and
-// expensive to have argued away: a proxy that lower-cases what it
-// forwards changes the bytes a signature was computed over, and an HTTP
-// message signature (RFC 9421) covers the field name as written.  So
-// lookup is case-insensitive (`get`) and storage is verbatim
-// (`fields_of`), and the two are different operations rather than one
-// operation with a lossy store behind it.
+// Lookup ignores case and storage keeps it.  An HTTP message signature
+// (RFC 9421) covers a field name as written, so a proxy that changed
+// the case would break the signature.
 pub struct H1Header
     // The field name exactly as it was written or supplied.
     name: Str
-    // The field value with leading and trailing optional whitespace
-    // removed, which RFC 9112 § 5 says is not part of the value.
+    // The field value without the optional whitespace around it, which
+    // RFC 9112 section 5 says is not part of the value.
     value: Str
 
-// H1Headers is a header section: the fields in order, with lookup by
-// name that ignores case.
+// H1Headers is a header section: the fields in the order they arrived,
+// with lookup by name that ignores case.
 //
-// A list and not a map, for the reason csv-nv's `Row` is a list: a map
-// loses the order the peer sent, cannot hold the repeated fields that
-// `Set-Cookie` and `Via` legitimately have, and costs a hash per field
-// on a path whose whole job is to be cheap.  `get` searches; a section
-// is a dozen fields and a search over a dozen strings is faster than
-// building a table nobody asked for.
+// A section is a list rather than a map because `Set-Cookie` and `Via`
+// may repeat, and because the order the peer sent is part of what it
+// sent.  Read the fields through `fields_of`; the field below may
+// change shape between releases.
 pub struct H1Headers
-    // The fields, in the order they arrived.  Reaching into this
-    // directly is what `fields_of` is for — the field is here because a
-    // struct needs one, and its shape is a decision this package
-    // intends to be free to change.
     fields: [H1Header]
 
-// H1Request is a request head: what a request line and its header
-// section said, and nothing about a body.
+// H1Request is a request head: the request line and the header section.
 pub struct H1Request
     method: H1Method
-    // The target exactly as it arrived, un-decoded.  `target_form`
-    // classifies it and url-nv parses it; this package does neither,
-    // because a percent-decode this package performed would be a
-    // percent-decode a caller could not opt out of, and a target's
-    // `%2F` is not a `/`.
+    // The target exactly as it arrived, not percent-decoded.
+    // `target_form` says which shape it has.
     target: Str
     version: H1Version
     headers: H1Headers
 
-// H1Response is a response head: what a status line and its header
-// section said, and nothing about a body.
+// H1Response is a response head: the status line and the header
+// section.
 pub struct H1Response
     version: H1Version
-    // The three-digit status, `100 ..= 599`.
+    // The three-digit status, from 100 to 599.
     status: Int
-    // The reason phrase as it arrived, which may be empty.  Kept
-    // because it is what the peer wrote, and discarded by nobody but
-    // the caller: RFC 9112 § 4 says a client MUST NOT act on it, and
-    // that is a rule about acting rather than about storing.
+    // The reason phrase as it arrived, which may be empty.  RFC 9112
+    // section 4 says a client ignores it.
     reason: Str
     headers: H1Headers
 
-// H1Framing is how long a message's body is, and how you know.
-//
-// This is the answer to the only question that matters between two
-// messages on one connection, and getting it wrong is the
-// request-smuggling class of bug in one sentence.  It is computed from
-// a head by `request_framing` and `response_framing` rather than stored
-// on one, because the same head frames differently depending on what it
-// is answering.
+// H1Framing is how long a message's body is, and how a recipient knows.
 pub enum H1Framing
-    // No body at all, and none is coming: a GET without a body, a 204,
-    // a 304, any response to HEAD.
+    // No body: a request with neither framing header, a 1xx, 204 or
+    // 304 response, any response to HEAD, and a 2xx answer to CONNECT.
     NoBody
     // Exactly `len` bytes, from `Content-Length`.
     FixedLength(len: Int)
-    // Chunked transfer coding — `len` is not known in advance and the
-    // last chunk says when it ends (RFC 9112 § 7.1).
+    // The chunked transfer coding: the body is a series of chunks and a
+    // chunk of size zero ends it (RFC 9112 section 7.1).
     ChunkedBody
-    // Until the peer closes the connection.  A response only: a request
-    // framed this way could never be answered, since the server would
-    // have to close to know the request had ended.  It also implies the
-    // connection cannot be reused, which `may_reuse` knows.
+    // Until the connection closes.  Responses only, and such a
+    // connection cannot carry another message.
     UntilClose
 
 // headers builds a header section from fields in the order given.
@@ -176,102 +129,388 @@ pub enum H1Framing
 //     let h = h1msg.headers([
 //         H1Header { name: "Host", value: "example.org" },
 //         H1Header { name: "Accept", value: "*/*" }])
-//     println("${h1msg.field_count(h)}")
+//     println("${h1msg.field_count(h)}")   // 2
 // ```
 pub fn headers(fields: [H1Header]) -> H1Headers
-    todo("http-codec-nv.h1msg.headers")
+    H1Headers { fields: list.clone(fields) }
 
 // no_headers is an empty header section.
-pub fn no_headers() -> H1Headers
-    todo("http-codec-nv.h1msg.no_headers")
-
-// name_eq compares two field names the way RFC 9110 § 5.1 says to:
-// ASCII case-insensitively, and only ASCII.
 //
-// Only ASCII is the point.  A Unicode case fold would make the Turkish
-// dotless `ı` equal to `I` and let one peer's `Content-Length` differ
-// from another's, which is a security property and not a nicety.
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println("${h1msg.field_count(h1msg.no_headers())}")   // 0
+// ```
+pub fn no_headers() -> H1Headers
+    H1Headers { fields: [] }
+
+// The byte with ASCII upper case folded to lower case.
+fn fold_byte(b: Int) -> Int
+    if b >= 'A' and b <= 'Z'
+        b + 32
+    else
+        b
+
+// name_eq compares two field names the way RFC 9110 section 5.1 says
+// to: ASCII case-insensitively, and only ASCII.
+//
+// A byte from 0x80 up compares only to itself, so no Unicode case rule
+// can make two different names equal.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println("${h1msg.name_eq("Content-Length", "content-length")}")   // true
+// ```
 pub fn name_eq(a: Str, b: Str) -> Bool
-    todo("http-codec-nv.h1msg.name_eq")
+    let n = str.len(a)
+    if n != str.len(b)
+        return false
+    for i in 0..n
+        if fold_byte(str.byte_at_or(a, i, 0)) != fold_byte(str.byte_at_or(b, i, 0))
+            return false
+    true
 
 // get is the first value of a named field, ignoring case, or `None`.
 //
-// First and not joined: a caller that needs every value of a repeated
-// field asks `get_all`, and one that joins `Set-Cookie` values with
-// commas has produced a cookie nobody can parse.
+// A repeated field answers its first value.  `get_all` answers every
+// value, and joining `Set-Cookie` values with commas makes a cookie
+// nobody can parse.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let h = h1msg.headers([H1Header { name: "Content-Type", value: "text/plain" }])
+//     println(h1msg.get(h, "content-type") ?? "absent")   // text/plain
+// ```
 pub fn get(h: H1Headers, name: Str) -> ?Str
-    todo("http-codec-nv.h1msg.get")
+    for f in h.fields
+        if name_eq(f.name, name)
+            return Some(f.value)
+    None
 
 // get_all is every value of a named field, in the order they arrived.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let h = h1msg.headers([
+//         H1Header { name: "Via", value: "1.1 a" },
+//         H1Header { name: "via", value: "1.1 b" }])
+//     println("${list.len(h1msg.get_all(h, "VIA"))}")   // 2
+// ```
 pub fn get_all(h: H1Headers, name: Str) -> [Str]
-    todo("http-codec-nv.h1msg.get_all")
+    var out: [Str] = []
+    for f in h.fields
+        if name_eq(f.name, name)
+            out = list.push(out, f.value)
+    out
 
-// has says whether a named field is present at all.
+// has says whether a named field is present.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println("${h1msg.has(h1msg.no_headers(), "Host")}")   // false
+// ```
 pub fn has(h: H1Headers, name: Str) -> Bool
-    todo("http-codec-nv.h1msg.has")
+    for f in h.fields
+        if name_eq(f.name, name)
+            return true
+    false
 
-// set replaces every copy of a named field with one carrying this
-// value, keeping the position the first copy had.
+// set is the section with every copy of a named field replaced by one
+// field carrying this value.
 //
-// Keeping the position matters for the same reason keeping the case
-// does: a section whose fields move when one is edited is a section
-// whose bytes change for no reason a reader of the diff can see.
+// The new field takes the position of the first copy and the name as
+// `set` was given it.  A field that was absent is added at the end.
+// The section passed in is not changed.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let h = h1msg.set(h1msg.no_headers(), "Accept", "*/*")
+//     println(h1msg.get(h, "accept") ?? "absent")   // */*
+// ```
 pub fn set(h: H1Headers, name: Str, value: Str) -> H1Headers
-    todo("http-codec-nv.h1msg.set")
+    var out: [H1Header] = []
+    var placed = false
+    for f in h.fields
+        if name_eq(f.name, name)
+            if not placed
+                out = list.push(out, H1Header { name: name, value: value })
+                placed = true
+        else
+            out = list.push(out, f)
+    if not placed
+        out = list.push(out, H1Header { name: name, value: value })
+    H1Headers { fields: out }
 
-// append adds a field after the existing ones without touching them.
+// append is the section with one more field at the end.
 //
-// This is what `Set-Cookie` and `Via` need and what `set` must not do.
+// Fields of the same name stay, which is what `Set-Cookie` and `Via`
+// need.  The section passed in is not changed.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let h = h1msg.append(h1msg.no_headers(), "Set-Cookie", "a=1")
+//     println("${h1msg.field_count(h1msg.append(h, "Set-Cookie", "b=2"))}")   // 2
+// ```
 pub fn append(h: H1Headers, name: Str, value: Str) -> H1Headers
-    todo("http-codec-nv.h1msg.append")
+    var out = list.clone(h.fields)
+    out = list.push(out, H1Header { name: name, value: value })
+    H1Headers { fields: out }
 
-// remove drops every copy of a named field.
+// remove is the section without any copy of a named field.
+//
+// The section passed in is not changed.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let h = h1msg.headers([H1Header { name: "Via", value: "1.1 a" }])
+//     println("${h1msg.has(h1msg.remove(h, "via"), "Via")}")   // false
+// ```
 pub fn remove(h: H1Headers, name: Str) -> H1Headers
-    todo("http-codec-nv.h1msg.remove")
+    var out: [H1Header] = []
+    for f in h.fields
+        if not name_eq(f.name, name)
+            out = list.push(out, f)
+    H1Headers { fields: out }
 
-// fields_of is every field, in order, in the case it arrived in.
+// fields_of is every field, in order, with names in the case they
+// arrived in.
+//
+// The list is a copy, so changing it does not change the section.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let h = h1msg.headers([H1Header { name: "X-Trace", value: "1" }])
+//     println(h1msg.fields_of(h)[0].name)   // X-Trace
+// ```
 pub fn fields_of(h: H1Headers) -> [H1Header]
-    todo("http-codec-nv.h1msg.fields_of")
+    list.clone(h.fields)
 
 // field_count is how many fields the section holds, repeats included.
-pub fn field_count(h: H1Headers) -> Int
-    todo("http-codec-nv.h1msg.field_count")
-
-// is_token says whether a string is a `tchar` token — a legal method,
-// a legal field name, a legal transfer coding (RFC 9110 § 5.6.2).
 //
-// Public because a caller building a header from user input needs the
-// same answer this package's encoder needs, and a caller that had to
-// re-derive it would derive it differently.
-pub fn is_token(s: Str) -> Bool
-    todo("http-codec-nv.h1msg.is_token")
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println("${h1msg.field_count(h1msg.no_headers())}")   // 0
+// ```
+pub fn field_count(h: H1Headers) -> Int
+    list.len(h.fields)
 
-// is_field_value says whether a string may be a field value: no CR, no
-// LF, no NUL, no leading or trailing space.
+// Whether a byte is a `tchar` (RFC 9110 section 5.6.2): a letter, a
+// digit, or one of the fifteen marks ``!#$%&'*+-.^_`|~``.
+fn is_tchar(b: Int) -> Bool
+    if b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b >= '0' and b <= '9'
+        return true
+    b == '!' or b == '#' or b == '$' or b == '%' or b == '&' or b == '\'' or b == '*' or b == '+' or b == '-' or b == '.' or b == '^' or b == '_' or b == '`' or b == '|' or b == '~'
+
+// Whether a byte may appear inside a field value: a visible ASCII
+// character, a space, a horizontal tab, or a byte from 0x80 up (RFC
+// 9110 section 5.5).
+fn is_field_byte(b: Int) -> Bool
+    b == ' ' or b == '\t' or b >= 0x21 and b <= 0x7E or b >= 0x80
+
+// is_token says whether a string is a token: one or more `tchar`
+// bytes (RFC 9110 section 5.6.2).
+//
+// Methods, field names and transfer coding names are tokens.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println("${h1msg.is_token("X-Trace-Id")}")   // true
+//     println("${h1msg.is_token("X Trace")}")      // false
+// ```
+pub fn is_token(s: Str) -> Bool
+    let n = str.len(s)
+    if n == 0
+        return false
+    for i in 0..n
+        if not is_tchar(str.byte_at_or(s, i, 0))
+            return false
+    true
+
+// is_field_value says whether a string may be a field value (RFC 9110
+// section 5.5).
+//
+// Visible ASCII, spaces, horizontal tabs and bytes from 0x80 up are
+// allowed, with no space or tab at either end.  A carriage return, a
+// line feed, a NUL or any other control character is not.  The empty
+// string is a legal value.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println("${h1msg.is_field_value("text/plain")}")      // true
+//     println("${h1msg.is_field_value("a\r\nX-Evil: 1")}")  // false
+// ```
 pub fn is_field_value(s: Str) -> Bool
-    todo("http-codec-nv.h1msg.is_field_value")
+    let n = str.len(s)
+    if n == 0
+        return true
+    let first = str.byte_at_or(s, 0, 0)
+    let last = str.byte_at_or(s, n - 1, 0)
+    if first == ' ' or first == '\t' or last == ' ' or last == '\t'
+        return false
+    for i in 0..n
+        if not is_field_byte(str.byte_at_or(s, i, 0))
+            return false
+    true
 
 // method_token is the method as it goes on the wire.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println(h1msg.method_token(Patch))   // PATCH
+// ```
 pub fn method_token(m: H1Method) -> Str
-    todo("http-codec-nv.h1msg.method_token")
+    match m
+        Get                    => "GET"
+        Head                   => "HEAD"
+        Post                   => "POST"
+        Put                    => "PUT"
+        Delete                 => "DELETE"
+        Connect                => "CONNECT"
+        Options                => "OPTIONS"
+        Trace                  => "TRACE"
+        Patch                  => "PATCH"
+        ExtensionMethod(token) => token
 
 // method_of reads a method token, exactly and case-sensitively.
 //
-// Every token that is legal `tchar` gets an answer — one of the nine
-// names, or `ExtensionMethod` — and a token that is not returns `None`.
+// A token names one of the nine methods or is an `ExtensionMethod`.  A
+// string that is not a token answers `None`.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     match h1msg.method_of("PROPFIND")
+//         Some(m) => println(h1msg.method_token(m))   // PROPFIND
+//         None    => println("not a token")
+// ```
 pub fn method_of(token: Str) -> ?H1Method
-    todo("http-codec-nv.h1msg.method_of")
+    if not is_token(token)
+        return None
+    if token == "GET"
+        return Some(Get)
+    if token == "HEAD"
+        return Some(Head)
+    if token == "POST"
+        return Some(Post)
+    if token == "PUT"
+        return Some(Put)
+    if token == "DELETE"
+        return Some(Delete)
+    if token == "CONNECT"
+        return Some(Connect)
+    if token == "OPTIONS"
+        return Some(Options)
+    if token == "TRACE"
+        return Some(Trace)
+    if token == "PATCH"
+        return Some(Patch)
+    Some(ExtensionMethod(token))
 
-// version_text is the version as it goes on the wire: `HTTP/1.1`.
+// Whether two methods are the same method.
+fn same_method(a: H1Method, b: H1Method) -> Bool
+    method_token(a) == method_token(b)
+
+// version_text is the version as it goes on the wire.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println(h1msg.version_text(Http11))   // HTTP/1.1
+// ```
 pub fn version_text(v: H1Version) -> Str
-    todo("http-codec-nv.h1msg.version_text")
+    match v
+        Http10 => "HTTP/1.0"
+        Http11 => "HTTP/1.1"
+
+// Whether every byte of a target is visible ASCII other than `#`.  A
+// request target is a URI reference without a fragment (RFC 9112
+// section 3.2), and a URI holds no other bytes.
+fn target_bytes_ok(t: Str) -> Bool
+    let n = str.len(t)
+    for i in 0..n
+        let b = str.byte_at_or(t, i, 0)
+        if b < 0x21 or b > 0x7E or b == '#'
+            return false
+    true
+
+// The length of a URI scheme at the start of a target (RFC 3986
+// section 3.1: a letter, then letters, digits, `+`, `-` and `.`), or 0.
+fn scheme_len(t: Str) -> Int
+    let n = str.len(t)
+    let b0 = str.byte_at_or(t, 0, 0)
+    if not (b0 >= 'a' and b0 <= 'z' or b0 >= 'A' and b0 <= 'Z')
+        return 0
+    for i in 1..n
+        let b = str.byte_at_or(t, i, 0)
+        if not (b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b >= '0' and b <= '9' or b == '+' or b == '-' or b == '.')
+            return i
+    n
+
+// Whether a target is `host:port` with a port of one or more digits.
+// The host is a registered name, an IPv4 address or a bracketed IP
+// literal, and holds no `/`, `?` or `@` (RFC 9112 section 3.2.3).
+fn is_authority(t: Str) -> Bool
+    let n = str.len(t)
+    var colon = -1
+    var i = n - 1
+    while i >= 0 and colon < 0
+        if str.byte_at_or(t, i, 0) == ':'
+            colon = i
+        i = i - 1
+    if colon <= 0 or colon == n - 1
+        return false
+    for j in colon + 1..n
+        let d = str.byte_at_or(t, j, 0)
+        if d < '0' or d > '9'
+            return false
+    let bracketed = str.byte_at_or(t, 0, 0) == '['
+    if bracketed and str.byte_at_or(t, colon - 1, 0) != ']'
+        return false
+    for k in 0..colon
+        let b = str.byte_at_or(t, k, 0)
+        if b == '/' or b == '?' or b == '@'
+            return false
+        if (b == '[' or b == ']' or b == ':') and not bracketed
+            return false
+    true
 
 // target_form classifies a request target, given the method it arrived
 // with.
 //
-// The method is a parameter because two of the four forms are legal
-// only with one method each, and `None` is the answer for a target that
-// is no form at all — or is a form this method may not use.
+// `None` is the answer for a target that has none of the four shapes,
+// and for a shape this method may not use: an authority-form target
+// with anything but CONNECT, an asterisk-form target with anything but
+// OPTIONS, and anything but an authority-form target with CONNECT.  An
+// absolute-form target here is a scheme followed by `://`, the shape
+// every `http` and `https` URI has (RFC 9110 section 4.2).  A target
+// holds visible ASCII only, and no `#`.
 //
 // ```novo
 // use h1msg
@@ -283,40 +522,187 @@ pub fn version_text(v: H1Version) -> Str
 //         None             => println("not a request target")
 // ```
 pub fn target_form(target: Str, m: H1Method) -> ?H1TargetForm
-    todo("http-codec-nv.h1msg.target_form")
+    if str.len(target) == 0 or not target_bytes_ok(target)
+        return None
+    if same_method(m, Connect)
+        if is_authority(target)
+            return Some(AuthorityForm)
+        return None
+    if target == "*"
+        if same_method(m, Options)
+            return Some(AsteriskForm)
+        return None
+    if str.byte_at_or(target, 0, 0) == '/'
+        return Some(OriginForm)
+    let s = scheme_len(target)
+    if s > 0 and str.len(target) > s + 3 and str.slice(target, s, s + 3) == "://"
+        return Some(AbsoluteForm)
+    None
+
+// How many spaces and tabs a string starts with.
+fn ows_len(s: Str) -> Int
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b != ' ' and b != '\t'
+            return i
+    str.len(s)
+
+// A string without the spaces and tabs at either end.
+fn trim_ows(s: Str) -> Str
+    let n = str.len(s)
+    let lo = ows_len(s)
+    var hi = n
+    while hi > lo and (str.byte_at_or(s, hi - 1, 0) == ' ' or str.byte_at_or(s, hi - 1, 0) == '\t')
+        hi = hi - 1
+    str.slice(s, lo, hi)
+
+// The elements of every copy of a comma-separated list field, trimmed,
+// without the empty elements RFC 9110 section 5.6.1 tells a recipient
+// to ignore.
+fn list_elements(h: H1Headers, name: Str) -> [Str]
+    var out: [Str] = []
+    for v in get_all(h, name)
+        for part in str.split(v, ",")
+            let t = trim_ows(part)
+            if str.len(t) > 0
+                out = list.push(out, t)
+    out
+
+// Whether a comma-separated list field names a token, ignoring case.
+fn list_has(h: H1Headers, name: Str, token: Str) -> Bool
+    for t in list_elements(h, name)
+        if name_eq(t, token)
+            return true
+    false
+
+// The body length the `Content-Length` fields of a section give.
+//
+// Every copy, and every element of a comma-separated copy, must be the
+// same run of decimal digits (RFC 9110 section 8.6).  Eighteen digits
+// is the most an `Int` holds without overflow.
+fn content_length(h: H1Headers, at: Int) -> Result<Int, h1err.H1DecodeError>
+    let copies = get_all(h, "Content-Length")
+    let text = str.join(copies, ", ")
+    var len = -1
+    for part in str.split(text, ",")
+        let t = trim_ows(part)
+        let n = str.len(t)
+        if n == 0 or n > 18
+            return Err(BadContentLength(at, text))
+        var v = 0
+        for i in 0..n
+            let d = str.byte_at_or(t, i, 0)
+            if d < '0' or d > '9'
+                return Err(BadContentLength(at, text))
+            v = v * 10 + (d - '0')
+        if len >= 0 and v != len
+            return Err(BadContentLength(at, text))
+        len = v
+    Ok(len)
+
+// Checks that a `Transfer-Encoding` section is exactly `chunked`.
+//
+// Only the chunked coding frames a message, and this package applies
+// no other.  A coding it does not apply is refused, and so is
+// `chunked` twice, which RFC 9112 section 7 forbids.
+fn check_chunked(h: H1Headers, at: Int) -> Result<Unit, h1err.H1DecodeError>
+    let codings = list_elements(h, "Transfer-Encoding")
+    if list.len(codings) == 0
+        return Err(UnsupportedTransferCoding(at, ""))
+    var seen = false
+    for c in codings
+        if not name_eq(c, "chunked")
+            return Err(UnsupportedTransferCoding(at, c))
+        if seen
+            return Err(ConflictingFraming(at))
+        seen = true
+    Ok(())
+
+// The framing a header section gives, when neither the method nor the
+// status has already decided it.  `none` is the answer for a section
+// with neither framing header.
+fn framing_of(h: H1Headers, none: H1Framing, at: Int) -> Result<H1Framing, h1err.H1DecodeError>
+    let te = has(h, "Transfer-Encoding")
+    let cl = has(h, "Content-Length")
+    if te and cl
+        return Err(ConflictingFraming(at))
+    if te
+        check_chunked(h, at)!
+        return Ok(ChunkedBody)
+    if cl
+        let n = content_length(h, at)!
+        return Ok(FixedLength(n))
+    Ok(none)
+
+// request_framing with the offset a refusal reports.
+fn request_framing_at(req: H1Request, at: Int) -> Result<H1Framing, h1err.H1DecodeError>
+    framing_of(req.headers, NoBody, at)
+
+// response_framing with the offset a refusal reports.
+fn response_framing_at(sent: H1Method, resp: H1Response,
+                       at: Int) -> Result<H1Framing, h1err.H1DecodeError>
+    if same_method(sent, Head) or status_forbids_body(resp.status)
+        return Ok(NoBody)
+    if same_method(sent, Connect) and resp.status >= 200 and resp.status <= 299
+        return Ok(NoBody)
+    framing_of(resp.headers, UntilClose, at)
 
 // request_framing is how long this request's body is.
 //
-// The rules, in the order RFC 9112 § 6 applies them: a
-// `Transfer-Encoding` ending in `chunked` frames the message; a
-// `Content-Length` frames it at that many bytes; both present is
-// `h1err.ConflictingFraming` and never a preference; neither means the
-// request has no body at all.  A request is never `UntilClose`.
-pub fn request_framing(req: H1Request) -> Result<H1Framing, H1DecodeError>
-    todo("http-codec-nv.h1msg.request_framing")
+// The rules, in the order RFC 9112 section 6 applies them.  A
+// `Transfer-Encoding` of `chunked` frames the body in chunks.  A
+// `Content-Length` frames it at that many bytes.  Both at once is
+// `ConflictingFraming`, and a transfer coding other than `chunked` is
+// `UnsupportedTransferCoding`.  Neither means the request has no body.
+// A request is never `UntilClose`.  A refusal's offset is 0, because a
+// head held as a value has no position in a stream.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let req = H1Request {
+//         method: Post, target: "/echo", version: Http11,
+//         headers: h1msg.headers([
+//             H1Header { name: "Host", value: "e.org" },
+//             H1Header { name: "Content-Length", value: "12" }]) }
+//     match h1msg.request_framing(req)
+//         Ok(FixedLength(n)) => println("${n} bytes")   // 12 bytes
+//         Ok(_)              => println("another framing")
+//         Err(e)             => println(e.message())
+// ```
+pub fn request_framing(req: H1Request) -> Result<H1Framing, h1err.H1DecodeError>
+    request_framing_at(req, 0)
 
 // response_framing is how long this response's body is, given the
 // method of the request it answers.
 //
-// THE METHOD ARGUMENT IS THE WHOLE POINT.  A response to HEAD carries
-// the `Content-Length` of the body it is not sending, and a client that
-// framed on that header alone waits forever for bytes that were never
-// coming — which is the oldest bug in HTTP client code and the reason
-// this signature will not let you not know the method.  The same
-// applies to a 204 and a 304, which `status_forbids_body` covers, and
-// to a 2xx answer to CONNECT, after which the connection stops being
-// HTTP at all.
-pub fn response_framing(sent: H1Method, resp: H1Response) -> Result<H1Framing, H1DecodeError>
-    todo("http-codec-nv.h1msg.response_framing")
-
-// status_forbids_body says whether a status code may never carry a
-// body: every 1xx, 204 and 304.
+// A response to HEAD carries the `Content-Length` of the body it does
+// not send (RFC 9110 section 9.3.2), so it frames as `NoBody` whatever
+// its headers say.  So do a 1xx, a 204 and a 304, and a 2xx answer to
+// CONNECT, after which the connection is a tunnel.  Otherwise the rules
+// are `request_framing`'s, except that a response with neither framing
+// header is `UntilClose` (RFC 9112 section 6.3).
 //
-// A PREDICATE AND NOT A PARAGRAPH.  This is one of the two rules a
-// caller most reliably gets wrong, and prose in a README is not
-// something a program can consult, so it is a function — and
-// `h1write.response` calls it, which means a program that ignores it
-// still cannot write the illegal message.
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let resp = H1Response {
+//         version: Http11, status: 200, reason: "OK",
+//         headers: h1msg.headers([H1Header { name: "Content-Length", value: "1024" }]) }
+//     match h1msg.response_framing(Head, resp)
+//         Ok(NoBody) => println("no body follows")   // no body follows
+//         Ok(_)      => println("a body follows")
+//         Err(e)     => println(e.message())
+// ```
+pub fn response_framing(sent: H1Method, resp: H1Response) -> Result<H1Framing, h1err.H1DecodeError>
+    response_framing_at(sent, resp, 0)
+
+// status_forbids_body says whether a status never carries a body: every
+// 1xx, 204 and 304 (RFC 9110 section 15).
+//
+// `h1write.response` refuses a body on such a status.
 //
 // ```novo
 // use h1msg
@@ -326,37 +712,126 @@ pub fn response_framing(sent: H1Method, resp: H1Response) -> Result<H1Framing, H
 //     println("${h1msg.status_forbids_body(200)}")   // false
 // ```
 pub fn status_forbids_body(status: Int) -> Bool
-    todo("http-codec-nv.h1msg.status_forbids_body")
+    status >= 100 and status <= 199 or status == 204 or status == 304
 
-// is_informational says whether a status is 1xx — a response a client
-// must read and then keep reading past, because the real one follows.
+// is_informational says whether a status is 1xx: an interim response
+// that a client reads and then keeps reading past, because the final
+// response follows.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println("${h1msg.is_informational(103)}")   // true
+// ```
 pub fn is_informational(status: Int) -> Bool
-    todo("http-codec-nv.h1msg.is_informational")
+    status >= 100 and status <= 199
 
-// status_reason is the reason phrase the IANA registry gives a status,
-// or an empty string for one it does not name.
+// status_reason is the reason phrase RFC 9110 section 15 gives a
+// status, or an empty string for a status it does not name.
 //
-// For an encoder that wants to write something and a log that wants to
-// print something.  A reader never needs it: what the peer sent is in
+// A reader never needs it: what the peer sent is in
 // `H1Response.reason`.
+//
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println(h1msg.status_reason(404))   // Not Found
+// ```
 pub fn status_reason(status: Int) -> Str
-    todo("http-codec-nv.h1msg.status_reason")
+    match status
+        100 => "Continue"
+        101 => "Switching Protocols"
+        102 => "Processing"
+        103 => "Early Hints"
+        200 => "OK"
+        201 => "Created"
+        202 => "Accepted"
+        203 => "Non-Authoritative Information"
+        204 => "No Content"
+        205 => "Reset Content"
+        206 => "Partial Content"
+        207 => "Multi-Status"
+        208 => "Already Reported"
+        226 => "IM Used"
+        300 => "Multiple Choices"
+        301 => "Moved Permanently"
+        302 => "Found"
+        303 => "See Other"
+        304 => "Not Modified"
+        305 => "Use Proxy"
+        307 => "Temporary Redirect"
+        308 => "Permanent Redirect"
+        400 => "Bad Request"
+        401 => "Unauthorized"
+        402 => "Payment Required"
+        403 => "Forbidden"
+        404 => "Not Found"
+        405 => "Method Not Allowed"
+        406 => "Not Acceptable"
+        407 => "Proxy Authentication Required"
+        408 => "Request Timeout"
+        409 => "Conflict"
+        410 => "Gone"
+        411 => "Length Required"
+        412 => "Precondition Failed"
+        413 => "Content Too Large"
+        414 => "URI Too Long"
+        415 => "Unsupported Media Type"
+        416 => "Range Not Satisfiable"
+        417 => "Expectation Failed"
+        421 => "Misdirected Request"
+        422 => "Unprocessable Content"
+        423 => "Locked"
+        424 => "Failed Dependency"
+        425 => "Too Early"
+        426 => "Upgrade Required"
+        428 => "Precondition Required"
+        429 => "Too Many Requests"
+        431 => "Request Header Fields Too Large"
+        451 => "Unavailable For Legal Reasons"
+        500 => "Internal Server Error"
+        501 => "Not Implemented"
+        502 => "Bad Gateway"
+        503 => "Service Unavailable"
+        504 => "Gateway Timeout"
+        505 => "HTTP Version Not Supported"
+        506 => "Variant Also Negotiates"
+        507 => "Insufficient Storage"
+        508 => "Loop Detected"
+        511 => "Network Authentication Required"
+        _   => ""
 
-// may_reuse says whether this connection can carry another message
-// after this exchange finished.
+// wants_close says whether a header section asks for the connection to
+// end after this message, at this version.
 //
-// THE SECOND RULE A CALLER MUST NOT GET WRONG, AND THE SECOND
-// PREDICATE.  Persistence in HTTP/1.1 is four rules that interact:
-// `Connection: close` from either party ends it; `HTTP/1.0` is not
-// persistent unless it said `Connection: keep-alive`; a response framed
-// `UntilClose` cannot be followed by anything, because the close IS the
-// framing; and a 101 or a 2xx answer to CONNECT hands the connection to
-// a different protocol entirely.  A client that reuses a connection it
-// should not have gets its next request answered by the tail of the
-// previous body, which is a data-disclosure bug rather than a hiccup.
+// At HTTP/1.1 it does when `Connection` names `close`.  At HTTP/1.0 it
+// does unless `Connection` names `keep-alive` (RFC 9112 section 9.3).
+// A server deciding what to put in its own `Connection` field asks this
+// of the request.
 //
-// Both heads are parameters because two of the four rules live in the
-// request and two in the response.
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     println("${h1msg.wants_close(Http10, h1msg.no_headers())}")   // true
+// ```
+pub fn wants_close(v: H1Version, h: H1Headers) -> Bool
+    if list_has(h, "Connection", "close")
+        return true
+    match v
+        Http10 => not list_has(h, "Connection", "keep-alive")
+        Http11 => false
+
+// may_reuse says whether the connection can carry another message
+// after this exchange.
+//
+// It cannot when either head asks to close (see `wants_close`), when
+// the response is framed `UntilClose` or cannot be framed at all, and
+// when the exchange handed the connection to another protocol (see
+// `is_upgrade`).  Two of these rules live in the request and two in the
+// response, so both heads are arguments (RFC 9112 section 9.3).
 //
 // ```novo
 // use h1msg
@@ -369,26 +844,34 @@ pub fn status_reason(status: Int) -> Str
 //         version: Http11, status: 200, reason: "OK",
 //         headers: h1msg.headers([
 //             H1Header { name: "Content-Length", value: "3" }]) }
-//     println("${h1msg.may_reuse(req, resp)}")
+//     println("${h1msg.may_reuse(req, resp)}")   // true
 // ```
 pub fn may_reuse(req: H1Request, resp: H1Response) -> Bool
-    todo("http-codec-nv.h1msg.may_reuse")
+    if wants_close(req.version, req.headers) or wants_close(resp.version, resp.headers)
+        return false
+    if is_upgrade(req.method, resp)
+        return false
+    match response_framing(req.method, resp)
+        Ok(UntilClose) => false
+        Ok(_)          => true
+        Err(_)         => false
 
-// wants_close says whether a header section asked for the connection to
-// end, at this version.
+// is_upgrade says whether this exchange leaves HTTP/1.1 behind: a 101
+// Switching Protocols, or a 2xx answering CONNECT.
 //
-// The half of `may_reuse` that one party can answer alone, exported
-// because a server deciding what to put in its own `Connection` field
-// needs it before it has a response to pass to `may_reuse`.
-pub fn wants_close(v: H1Version, h: H1Headers) -> Bool
-    todo("http-codec-nv.h1msg.wants_close")
-
-// is_upgrade says whether this exchange left HTTP/1.1 behind: a 101
-// answering an `Upgrade` request, or a 2xx answering a CONNECT.
+// After `true`, what follows on the connection is not HTTP/1.1, and a
+// caller stops feeding it to this package.
 //
-// A caller that gets `true` must stop feeding bytes to this package —
-// what follows on the connection is not HTTP/1.1 and this package would
-// be reading it as if it were.  websocket-codec-nv is the first
-// consumer of this answer.
+// ```novo
+// use h1msg
+//
+// fn main() [io]
+//     let resp = H1Response {
+//         version: Http11, status: 101, reason: "Switching Protocols",
+//         headers: h1msg.headers([H1Header { name: "Upgrade", value: "websocket" }]) }
+//     println("${h1msg.is_upgrade(Get, resp)}")   // true
+// ```
 pub fn is_upgrade(sent: H1Method, resp: H1Response) -> Bool
-    todo("http-codec-nv.h1msg.is_upgrade")
+    if resp.status == 101
+        return true
+    same_method(sent, Connect) and resp.status >= 200 and resp.status <= 299

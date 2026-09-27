@@ -1,37 +1,74 @@
 // h1write.nv — HTTP/1.1 messages as bytes.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Every function answers the bytes of a message or a piece of one, and
+// the caller sends them.  Nothing here takes a writer or a socket.
 //
-// AN ENCODER RETURNS BYTES.  It does not take a writer, it does not
-// take a socket and it does not print: a library does not decide for
-// the program that embeds it that something appears anywhere
-// (`docs/publishing.md` § Design).  What comes back is a `[u8]` the
-// caller sends, files, hashes or throws away.
+// The encoder refuses what the reader refuses.  A body on a 204, a
+// field value with a line break in it, and `Content-Length` beside
+// `Transfer-Encoding` are `H1EncodeError`s here rather than messages a
+// peer has to reject.
 //
-// AN ENCODER REFUSES WHAT A READER WOULD REFUSE.  The rules in
-// `h1msg` — a 204 has no body, a header value has no newline in it,
-// `Content-Length` and `Transfer-Encoding` are not both present — are
-// enforced HERE and not only documented, because a rule that is only
-// documented is a rule that produces the illegal message and then a bug
-// report from the far end.  That is what `H1EncodeError` is for and why
-// it is a different type from `H1DecodeError`: this one is the calling
-// program's fault.
-//
-// THE STREAMING FORM IS THE PRIMARY ONE.  `response_head` then `chunk`
-// then `last_chunk` writes a body of any size with a constant amount of
-// memory; `response` is the convenience for a caller that already holds
-// the whole body and wants one call.  A package that offered only the
-// second would have made streaming somebody else's problem, which for
-// a codec is most of the problem.
+// A body of any size is written as a head that declares chunked
+// transfer coding, then `chunk` for each piece, then `last_chunk`.
+// `request` and `response` write a whole message whose body is already
+// in memory.
+
+use std.str
+use std.bytes
+use h1msg
+use h1err
+
+// The bytes of a string.
+fn wire(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+// Checks every field of a section against the rules a reader applies,
+// and that at most one framing header is present.
+fn check_fields(h: H1Headers) -> Result<Unit, H1EncodeError>
+    for f in h.fields
+        if not h1msg.is_token(f.name)
+            return Err(BadHeaderNameToWrite(f.name))
+        if not h1msg.is_field_value(f.value)
+            return Err(BadHeaderValueToWrite(f.name))
+    if h1msg.has(h, "Content-Length") and h1msg.has(h, "Transfer-Encoding")
+        return Err(FramingConflictToWrite)
+    Ok(())
+
+// The field lines of a section and the blank line after them.
+fn field_lines(h: H1Headers) -> Str
+    var s = ""
+    for f in h.fields
+        s = s + f.name + ": " + f.value + "\r\n"
+    s + "\r\n"
+
+// Whether a request target holds only bytes a target may hold: visible
+// ASCII other than `#`.
+fn target_ok(t: Str) -> Bool
+    let n = str.len(t)
+    if n == 0
+        return false
+    for i in 0..n
+        let b = str.byte_at_or(t, i, 0)
+        if b < 0x21 or b > 0x7E or b == '#'
+            return false
+    true
+
+// Whether a reason phrase holds only tabs, spaces, visible ASCII and
+// bytes from 0x80 up (RFC 9112 section 4).
+fn reason_ok(s: Str) -> Bool
+    let n = str.len(s)
+    for i in 0..n
+        if not h1msg.is_field_byte(str.byte_at_or(s, i, 0))
+            return false
+    true
 
 // request_head is a request line and its header section, ending in the
 // blank line.
 //
-// It writes what the head says and adds nothing: no `Host` it invented,
-// no `Content-Length` it computed, no `User-Agent`.  A caller that
-// wants framing headers puts them there — `with_content_length` and
-// `with_chunked` are the two spellings — and `request` is the form that
-// does it for you.
+// It writes what the head says and adds nothing: no `Host`, no
+// `Content-Length`, no `User-Agent`.  `with_content_length` and
+// `with_chunked` add the framing header, and `request` adds it for
+// you.  The method, the target and every field are checked.
 //
 // ```novo
 // use h1msg
@@ -42,78 +79,181 @@
 //         method: Get, target: "/", version: Http11,
 //         headers: h1msg.headers([H1Header { name: "Host", value: "e.org" }]) }
 //     match h1write.request_head(req)
-//         Ok(bytes) => println("${list.len(bytes)} byte(s)")
+//         Ok(bytes) => println("${list.len(bytes)} bytes")   // 31 bytes
 //         Err(e)    => println(e.message())
 // ```
 pub fn request_head(req: H1Request) -> Result<[u8], H1EncodeError>
-    todo("http-codec-nv.h1write.request_head")
+    let token = h1msg.method_token(req.method)
+    if not h1msg.is_token(token)
+        return Err(BadMethodTokenToWrite(token))
+    if not target_ok(req.target)
+        return Err(BadTargetToWrite(req.target))
+    check_fields(req.headers)!
+    let line = token + " " + req.target + " " + h1msg.version_text(req.version) + "\r\n"
+    Ok(wire(line + field_lines(req.headers)))
 
 // response_head is a status line and its header section, ending in the
 // blank line.
+//
+// The status, the reason phrase and every field are checked.  An empty
+// reason phrase is written as none, which RFC 9112 section 4 allows.
+//
+// ```novo
+// use h1msg
+// use h1write
+//
+// fn main() [io]
+//     let resp = H1Response { version: Http11, status: 204, reason: "No Content", headers: h1msg.no_headers() }
+//     match h1write.response_head(resp)
+//         Ok(bytes) => println("${list.len(bytes)} bytes")   // 27 bytes
+//         Err(e)    => println(e.message())
+// ```
 pub fn response_head(resp: H1Response) -> Result<[u8], H1EncodeError>
-    todo("http-codec-nv.h1write.response_head")
+    if resp.status < 100 or resp.status > 599
+        return Err(BadStatusCodeToWrite(resp.status))
+    if not reason_ok(resp.reason)
+        return Err(BadReasonToWrite(resp.reason))
+    check_fields(resp.headers)!
+    let line = h1msg.version_text(resp.version) + " " + str.from_int(resp.status) + " " + resp.reason + "\r\n"
+    Ok(wire(line + field_lines(resp.headers)))
 
-// with_content_length is the header section plus a `Content-Length`,
-// with any `Transfer-Encoding` removed.
+// with_content_length is the section with `Content-Length` set to
+// `len` and any `Transfer-Encoding` removed.
 //
-// Removed rather than left to collide: a caller that switched a
-// response from chunked to fixed-length and forgot to drop the old
-// header would have written the ambiguous message that
-// `h1err.ConflictingFraming` exists to catch, and catching it in your
-// own encoder is later than catching it here.
+// A section that switched from chunked to a fixed length keeps no
+// stale framing header, so the pair RFC 9112 section 6.1 forbids is
+// never written.
+//
+// ```novo
+// use h1msg
+// use h1write
+//
+// fn main() [io]
+//     let h = h1write.with_content_length(h1msg.no_headers(), 12)
+//     println(h1msg.get(h, "content-length") ?? "absent")   // 12
+// ```
 pub fn with_content_length(h: H1Headers, len: Int) -> H1Headers
-    todo("http-codec-nv.h1write.with_content_length")
+    h1msg.set(h1msg.remove(h, "Transfer-Encoding"), "Content-Length", str.from_int(len))
 
-// with_chunked is the header section plus `Transfer-Encoding: chunked`,
-// with any `Content-Length` removed.
-pub fn with_chunked(h: H1Headers) -> H1Headers
-    todo("http-codec-nv.h1write.with_chunked")
-
-// chunk is one chunk of a chunked body: its size in hexadecimal, CRLF,
-// the data, CRLF.
+// with_chunked is the section with `Transfer-Encoding: chunked` and
+// any `Content-Length` removed.
 //
-// An EMPTY `data` would encode as the last chunk and end the message,
-// which is almost never what a caller with nothing to send right now
-// means, so it is refused — `last_chunk` is how you end a body, and
-// making the two different calls is what stops a zero-length write from
-// silently closing a response.
-pub fn chunk(data: [u8]) -> Result<[u8], H1EncodeError>
-    todo("http-codec-nv.h1write.chunk")
+// ```novo
+// use h1msg
+// use h1write
+//
+// fn main() [io]
+//     let h = h1write.with_chunked(h1msg.no_headers())
+//     println(h1msg.get(h, "transfer-encoding") ?? "absent")   // chunked
+// ```
+pub fn with_chunked(h: H1Headers) -> H1Headers
+    h1msg.set(h1msg.remove(h, "Content-Length"), "Transfer-Encoding", "chunked")
 
-// last_chunk ends a chunked body: the zero-size chunk, the trailer
+// The lower-case hexadecimal spelling of a positive number.
+fn hex_of(n: Int) -> Str
+    let digits = "0123456789abcdef"
+    var s = ""
+    var v = n
+    while v > 0
+        s = str.slice(digits, v % 16, v % 16 + 1) + s
+        v = v / 16
+    s
+
+// chunk is one chunk of a chunked body: its size in hexadecimal, a
+// line break, the data and a line break (RFC 9112 section 7.1).
+//
+// An empty `data` is refused, because a chunk of size zero ends the
+// body.  `last_chunk` is the call that ends one.
+//
+// ```novo
+// use h1write
+//
+// fn main() [io]
+//     match h1write.chunk([104 as u8, 105 as u8])
+//         Ok(bytes) => println("${list.len(bytes)} bytes")   // 7 bytes
+//         Err(e)    => println(e.message())
+// ```
+pub fn chunk(data: [u8]) -> Result<[u8], H1EncodeError>
+    let n = list.len(data)
+    if n == 0
+        return Err(EmptyChunkToWrite)
+    let head = wire(hex_of(n) + "\r\n")
+    Ok(list.concat(list.concat(head, data), wire("\r\n")))
+
+// last_chunk ends a chunked body: the chunk of size zero, the trailer
 // fields, and the blank line.
 //
-// Pass `h1msg.no_headers()` for a body with no trailers, which is the
-// ordinary case.  A trailer field HTTP forbids in a trailer section —
-// `Content-Length`, `Transfer-Encoding`, `Host` — is refused here for
-// the same reason the reader refuses one.
+// Pass `h1msg.no_headers()` for a body with no trailer section.  The
+// three fields RFC 9110 section 6.5.1 forbids in a trailer section,
+// `Content-Length`, `Transfer-Encoding` and `Host`, are refused.
+//
+// ```novo
+// use h1msg
+// use h1write
+//
+// fn main() [io]
+//     match h1write.last_chunk(h1msg.no_headers())
+//         Ok(bytes) => println("${list.len(bytes)} bytes")   // 5 bytes
+//         Err(e)    => println(e.message())
+// ```
 pub fn last_chunk(trailers: H1Headers) -> Result<[u8], H1EncodeError>
-    todo("http-codec-nv.h1write.last_chunk")
+    for f in trailers.fields
+        if h1msg.name_eq(f.name, "Content-Length") or h1msg.name_eq(f.name, "Transfer-Encoding") or h1msg.name_eq(f.name, "Host")
+            return Err(ForbiddenTrailerToWrite(f.name))
+    check_fields(trailers)!
+    Ok(wire("0\r\n" + field_lines(trailers)))
 
-// request is a whole request — head, framing header and body — in one
-// call.
+// The section with a `Content-Length` for a body of `n` bytes, or the
+// refusal when the section already declares a different length.
+fn framed_for(h: H1Headers, n: Int) -> Result<H1Headers, H1EncodeError>
+    match h1msg.get(h, "Content-Length")
+        Some(v) =>
+            let declared = str.to_int(v) ?? -1
+            if declared != n
+                return Err(LengthDisagreesWithBody(declared, n))
+        None    => ()
+    Ok(with_content_length(h, n))
+
+// request is a whole request: head, framing header and body.
 //
-// Adds `Content-Length` for the body it was given, and refuses a
-// request with neither a `Host` header nor an absolute-form target at
-// `HTTP/1.1`.  For a body that does not fit in memory, use
-// `request_head` with `with_chunked` and then `chunk`.
+// It adds `Content-Length` when the body is not empty, and refuses a
+// declared length that disagrees with the body.  An HTTP/1.1 request
+// needs a `Host` field or an absolute-form target (RFC 9112 section
+// 3.2).  For a body that does not fit in memory, use `request_head`
+// with `with_chunked`, then `chunk`.
+//
+// ```novo
+// use h1msg
+// use h1write
+//
+// fn main() [io]
+//     let req = H1Request {
+//         method: Post, target: "/echo", version: Http11,
+//         headers: h1msg.headers([H1Header { name: "Host", value: "e.org" }]) }
+//     match h1write.request(req, [104 as u8, 105 as u8])
+//         Ok(bytes) => println("${list.len(bytes)} bytes")   // 57 bytes
+//         Err(e)    => println(e.message())
+// ```
 pub fn request(req: H1Request, body: [u8]) -> Result<[u8], H1EncodeError>
-    todo("http-codec-nv.h1write.request")
+    if req.version == Http11 and not h1msg.has(req.headers, "Host")
+        if h1msg.target_form(req.target, req.method) != Some(AbsoluteForm)
+            return Err(MissingHost)
+    var h = req.headers
+    if list.len(body) > 0
+        h = framed_for(req.headers, list.len(body))!
+    let head = request_head(H1Request { method: req.method, target: req.target, version: req.version, headers: h })!
+    Ok(list.concat(head, body))
 
-// response is a whole response — head, framing header and body — in one
-// call, for the request method it answers.
+// response is a whole response for the request method it answers:
+// head, framing header and body.
 //
-// THE SIGNATURE IS THE RULE.  `sent` is there because the two ways to
-// write a response that nobody can read are to put a body on a 204 and
-// to put a body on the answer to a HEAD, and the second is invisible
-// from the response alone.  With the method in hand this call can
-// refuse both — `BodyForbiddenForStatus` and `BodyForbiddenForHead` —
-// rather than leave a caller to consult `h1msg.status_forbids_body` and
-// remember the HEAD case on its own.
-//
-// A 304 keeps the `Content-Length` its headers carry, because RFC 9110
-// § 15.4.5 says a 304 SHOULD carry the header the 200 would have
-// carried; what it may not carry is the bytes.
+// A body on a status that forbids one is `BodyForbiddenForStatus`, and
+// a body on the answer to HEAD is `BodyForbiddenForHead`.  The second
+// cannot be seen from the response alone, which is why the method is
+// an argument.  Such a response is written with its headers as given,
+// so a 304 or the answer to HEAD keeps the `Content-Length` of the body
+// it does not send (RFC 9110 section 15.4.5).  Any other response gets
+// a `Content-Length` for its body, 0 included.
 //
 // ```novo
 // use h1msg
@@ -123,39 +263,79 @@ pub fn request(req: H1Request, body: [u8]) -> Result<[u8], H1EncodeError>
 //     let resp = H1Response {
 //         version: Http11, status: 204, reason: "No Content",
 //         headers: h1msg.no_headers() }
-//     match h1write.response(Get, resp, [0x68 as u8])
+//     match h1write.response(Get, resp, [104 as u8])
 //         Ok(_)  => println("this does not happen")
-//         Err(e) => println(e.message())    // a 204 has no body
+//         Err(e) => println(e.message())   // a 204 response has no body
 // ```
 pub fn response(sent: H1Method, resp: H1Response, body: [u8]) -> Result<[u8], H1EncodeError>
-    todo("http-codec-nv.h1write.response")
+    let n = list.len(body)
+    let forbidden = h1msg.status_forbids_body(resp.status)
+    let head_request = h1msg.same_method(sent, Head)
+    if n > 0 and forbidden
+        return Err(BodyForbiddenForStatus(resp.status))
+    if n > 0 and head_request
+        return Err(BodyForbiddenForHead)
+    var h = resp.headers
+    if not forbidden and not head_request
+        h = framed_for(resp.headers, n)!
+    let head = response_head(H1Response { version: resp.version, status: resp.status, reason: resp.reason, headers: h })!
+    Ok(list.concat(head, body))
 
-// continue_head is the `100 Continue` interim response, ready to send.
+// continue_head is the `100 Continue` interim response.
 //
-// A named constant rather than a shape a caller assembles, because a
-// server that answers `Expect: 100-continue` has to send exactly this
-// and then keep the connection in the state it was in — and a server
-// that assembles it by hand gets the second part wrong.
+// A server sends it to a request carrying `Expect: 100-continue`, and
+// then reads the body (RFC 9110 section 10.1.1).
+//
+// ```novo
+// use h1write
+//
+// fn main() [io]
+//     println("${list.len(h1write.continue_head())} bytes")   // 25 bytes
+// ```
 pub fn continue_head() -> [u8]
-    todo("http-codec-nv.h1write.continue_head")
+    wire("HTTP/1.1 100 Continue\r\n\r\n")
 
-// switching_protocols_head is a `101` response with the given
-// `Upgrade` and any extra fields.
+// switching_protocols_head is a `101 Switching Protocols` response
+// with `Connection: upgrade`, the given `Upgrade` and any extra fields.
 //
-// The handshake half of every protocol that starts as HTTP/1.1 and
-// stops being it — websocket-codec-nv's `check_upgrade_request` hands
-// its answer here.  After these bytes go out, nothing else on the
-// connection is HTTP and the caller stops feeding this package.
+// After these bytes the connection carries the named protocol, and the
+// caller stops feeding it to this package.
+//
+// ```novo
+// use h1msg
+// use h1write
+//
+// fn main() [io]
+//     match h1write.switching_protocols_head("websocket", h1msg.no_headers())
+//         Ok(bytes) => println("${list.len(bytes)} bytes")   // 77 bytes
+//         Err(e)    => println(e.message())
+// ```
 pub fn switching_protocols_head(upgrade: Str, extra: H1Headers) -> Result<[u8], H1EncodeError>
-    todo("http-codec-nv.h1write.switching_protocols_head")
+    if str.len(upgrade) == 0 or not h1msg.is_field_value(upgrade)
+        return Err(BadHeaderValueToWrite("Upgrade"))
+    var h = h1msg.headers([
+        H1Header { name: "Connection", value: "upgrade" },
+        H1Header { name: "Upgrade", value: upgrade }])
+    for f in extra.fields
+        h = h1msg.append(h, f.name, f.value)
+    response_head(H1Response { version: Http11, status: 101, reason: "Switching Protocols", headers: h })
 
-// error_head is a minimal response for a refusal a reader produced:
-// the status `h1err.status_for` chose, `Connection: close`, and no
-// body.
+// error_head is the whole response to a refusal a reader produced: the
+// status `h1err.status_for` chose, `Connection: close`, and a
+// `Content-Length` of 0.
 //
-// `None` when the refusal has no answer — the peer is already gone, or
-// the fault was the caller's own.  It exists so that the ordinary
-// server response to a malformed request is one call rather than a
-// paragraph of assembly every server writes slightly differently.
+// `None` when the refusal has nobody to answer.
+//
+// ```novo
+// use h1write
+//
+// fn main() [io]
+//     match h1write.error_head(BadStartLine(0))
+//         Some(bytes) => println("${list.len(bytes)} bytes")   // 66 bytes
+//         None        => println("nobody to answer")
+// ```
 pub fn error_head(e: H1DecodeError) -> ?[u8]
-    todo("http-codec-nv.h1write.error_head")
+    let Some(status) = h1err.status_for(e) else
+        return None
+    let line = "HTTP/1.1 " + str.from_int(status) + " " + h1msg.status_reason(status) + "\r\n"
+    Some(wire(line + "Connection: close\r\nContent-Length: 0\r\n\r\n"))

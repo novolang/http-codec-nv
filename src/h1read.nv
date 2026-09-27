@@ -1,280 +1,846 @@
-// h1read.nv — the load-bearing interface: an HTTP/1.1 reader that
-// performs nothing.
+// h1read.nv — the reader: bytes in, events out, and no input or output
+// of its own.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// The host holds the connection.  It hands the reader whatever bytes
+// it has with `feed`, and takes back the events those bytes completed.
+// A message comes out as a head, then any number of `BodyBytes`, then
+// at most one `Trailers`, then `MessageDone`.
 //
-// THE SHAPE, AND WHY IT IS THIS ONE
+//     let step = h1read.feed(r, chunk)!     // add bytes, take one event
+//     let more = h1read.take(step.reader)!  // take the next, until None
 //
-// `http-codec-nv` is a `core` package, so its budget is no effects at
-// all: it may not open a socket, set a timeout, or wait.  An HTTP
-// message is exactly the thing a caller wants to stream, and a large
-// one is exactly the thing a caller cannot afford to hold.  Those facts
-// are reconciled by a FEED-AND-DRAIN STATE MACHINE: the host holds the
-// connection, hands this package whatever bytes it has, and takes back
-// the events those bytes completed.
+// One call answers at most one event.  An `event` of `None` means the
+// reader holds only part of the next event, which on a socket is the
+// ordinary case and not a fault.
 //
-//     var r = h1read.reader(ReadsRequests, h1read.default_limits())
-//     let step = h1read.feed(r, chunk)!      // as many times as you like
-//     let more = h1read.take(step.reader)!   // until `event` is None
+// A reader parses one direction.  A request head and a response head
+// are two grammars, so a server holds a `ReadsRequests` reader and a
+// client a `ReadsResponses` one.
 //
-// ONE EVENT PER CALL, and `event: None` means "not yet" rather than
-// "never".  That is the same distinction `hci-codec-nv` draws between
-// its `Scan` and its `DecodeError`, arrived at here for the same
-// reason: a partial message is the normal case on a socket, and a codec
-// that reported it as an error would have every caller filtering one
-// error variant out of its logs forever.
+// A response's framing depends on the method of the request it
+// answers (see `h1msg.response_framing`), and the request went out
+// through a socket this package never saw.  A client therefore calls
+// `expect` with each method it sends, in the order it sends them.
 //
-// WHY A READER READS ONE DIRECTION
-//
-// `H1Role` fixes what a reader parses, because a request head and a
-// response head are two different grammars that begin with tokens you
-// cannot tell apart until the second field.  A server holds a
-// `ReadsRequests`; a client holds a `ReadsResponses`; nothing holds
-// one that guesses.
-//
-// THE ONE THING A CLIENT MUST TELL THE READER
-//
-// A response's framing depends on the method of the request it answers
-// (`h1msg.response_framing` says why), and a reader cannot know that:
-// the request went out through a socket this package never saw.  So a
-// client calls `expect` with the method it sent, before the response
-// arrives.  A `ReadsResponses` reader that was never told refuses with
-// `MessageStillOpen` rather than guessing GET — guessing GET is how a
-// client hangs forever on a HEAD.
+// Every value here is replaced rather than changed: `feed` answers a
+// new reader and leaves the one it was given as it was.
+
+use std.str
+use std.bytes
+use h1msg
+use h1err
 
 // H1Role is which direction of the conversation a reader parses.
 pub enum H1Role
-    // A server's reader: request heads in, response heads out.
+    // A server's reader: it reads request heads.
     ReadsRequests
-    // A client's reader: response heads in, and `expect` must be told
+    // A client's reader: it reads response heads, and `expect` tells it
     // the method of each request that went out.
     ReadsResponses
 
-// H1Limits is what a reader will refuse to grow past.
+// H1Limits is what a reader refuses to grow past.
 //
-// Every one of these exists because the corresponding unbounded version
-// is a denial of service that costs the attacker one open socket: a
-// head with no blank line, a header section of a million fields, a
-// chunk claiming 2^63 bytes.  They are a value the caller owns rather
-// than constants this package chose, because an embedded consumer wants
-// numbers three orders of magnitude smaller than a reverse proxy does.
+// Each limit bounds the memory one peer can make the reader hold: a
+// head with no blank line, a section of a million fields, a chunk
+// claiming 2^60 bytes.  The caller chooses them, because a device and a
+// reverse proxy want numbers orders of magnitude apart.
 pub struct H1Limits
-    // Bytes in the start line and header section together, before the
-    // blank line that ends them.  Exceeding it is `HeadTooLarge`, which
-    // `h1err.status_for` answers 431.
+    // Bytes in the start line and header section together, blank line
+    // included.  Past it is `HeadTooLarge`.  The same bound applies to
+    // a trailer section and to one chunk-size line.
     max_head: Int
     // Fields in one header section, and separately in one trailer
-    // section.  Exceeding it is `TooManyHeaders`.
+    // section.  Past it is `TooManyHeaders`.
     max_headers: Int
-    // Bytes in one chunk of a chunked body.  Exceeding it is
-    // `ChunkTooLarge`.  It bounds the buffer, not the message: a body
-    // of any size passes through in chunks this big.
+    // Bytes in one chunk of a chunked body.  Past it is
+    // `ChunkTooLarge`.  It bounds a chunk, not the body.
     max_chunk: Int
 
 // H1Event is one thing that came out of a reader.
-//
-// A message arrives as a head, then zero or more `BodyBytes`, then at
-// most one `Trailers`, then exactly one `MessageDone`.  A caller that
-// only wants whole small messages accumulates the `BodyBytes` itself;
-// a caller streaming a 4 GB upload writes each one out and keeps
-// nothing, which is the case the head/body split exists for.
 pub enum H1Event
-    // A request head, complete.  Only from a `ReadsRequests` reader.
+    // A complete request head.  Only a `ReadsRequests` reader produces
+    // one.
     RequestHead(req: H1Request)
-    // A response head, complete.  Only from a `ReadsResponses` reader.
-    // A 1xx arrives as its own `ResponseHead` followed immediately by
-    // `MessageDone`, and the real response follows — `h1msg`'s
-    // `is_informational` is how a caller tells them apart.
+    // A complete response head.  Only a `ReadsResponses` reader
+    // produces one.  A 1xx other than 101 is followed by `MessageDone`
+    // and then by the final response to the same request.
     ResponseHead(resp: H1Response)
-    // Some of the body.  NOT a whole chunk and not a whole anything:
-    // the reader hands over what it has, chunk framing already removed,
-    // and the number of these events for a given body is an artefact of
-    // how the host read its socket.  A caller that treats one
-    // `BodyBytes` as one application message has written a bug that
-    // works on localhost.
+    // Some of the body, with the chunk framing removed.  How many of
+    // these one body produces depends on how the host read its socket,
+    // so one `BodyBytes` is not one of anything.
     BodyBytes(data: [u8])
-    // The trailer section of a chunked body.  At most one, immediately
-    // before `MessageDone`, and absent when there was none.
+    // The trailer section of a chunked body, when it has one.  It comes
+    // immediately before `MessageDone`.
     Trailers(fields: H1Headers)
-    // The message ended.  After this the reader is ready for the next
-    // one on the same connection — if `h1msg.may_reuse` said there may
-    // be a next one.
+    // The message ended.  The reader is ready for the next message on
+    // the same connection.
     MessageDone
 
 // H1Step is a reader and the one event that came out of it, if one did.
-//
-// A struct rather than a tuple because a tuple's components come out
-// only through `match`, which reads badly for a value whose two halves
-// are used at different places: the caller reassigns one and dispatches
-// on the other.  csv-nv returns a tuple here and hci-codec-nv a struct;
-// this package follows hci-codec-nv, because an HTTP caller loops on
-// the event and carries the reader across iterations rather than
-// destructuring both once.
 pub struct H1Step
     reader: H1Reader
-    // `None` means "no complete event in what I have been given yet",
-    // which on a socket is the ordinary case and not a fault.
+    // `None` means no complete event is buffered yet.
     event: ?H1Event
 
-// H1Reader is the state between "some bytes turned up" and "here is an
-// event".
+// H1Reader is the state between bytes arriving and events leaving.
 //
-// Opaque: the fields are here because a struct needs them, and a caller
-// that reaches into one has coupled itself to a buffering decision this
-// package intends to change.  `pending_len` and `offset` are the two
-// facts about a reader that are anybody's business.
+// Read it through `pending_len`, `offset` and `message_open`.  Its
+// fields may change between releases.
 pub struct H1Reader
     role: H1Role
     limits: H1Limits
+    // Bytes received and not yet turned into an event.
     pending: [u8]
+    // Bytes turned into events since the reader was made.  The offset
+    // of `pending`'s first byte in the stream.
     consumed: Int
+    // Where in a message the reader is.  One of the `phase_` values
+    // below.
+    phase: Int
+    // Body bytes still due: the rest of a fixed-length body, or of the
+    // current chunk.
+    remaining: Int
+    // Methods of requests sent and not yet answered, oldest first.
+    methods: [H1Method]
+    // Whether `finish` has said the peer closed.
+    closed: Bool
+    // The status of the last response, when it was one that may not
+    // have a body, and 0 otherwise.
+    no_body_status: Int
 
 // H1Drained is a reader and every event a drain produced.
 pub struct H1Drained
     reader: H1Reader
     events: [H1Event]
 
+// Between messages, waiting for a start line.
+const PHASE_IDLE = 0
+// A head has been answered and `MessageDone` is next.
+const PHASE_DONE = 1
+// Inside a body framed by `Content-Length`.
+const PHASE_FIXED = 2
+// Inside a body framed by the close of the connection.
+const PHASE_UNTIL_CLOSE = 3
+// Waiting for a chunk-size line.
+const PHASE_CHUNK_SIZE = 4
+// Inside the data of one chunk.
+const PHASE_CHUNK_DATA = 5
+// Waiting for the line break after a chunk's data.
+const PHASE_CHUNK_END = 6
+// Waiting for the trailer section after the last chunk.
+const PHASE_TRAILERS = 7
+
+// How many bytes `drain` asks its source for at a time.
+const DRAIN_READ = 4096
+
+// One pass of the reader's loop: the reader after it, the event it
+// produced if any, and whether it changed anything.
+struct H1Advance
+    reader: H1Reader
+    event: ?H1Event
+    moved: Bool
+
 // default_limits is a head of 64 KiB, 128 fields and chunks of 1 MiB.
 //
-// The numbers are nginx's `large_client_header_buffers` and Go's
-// `MaxHeaderBytes` rounded to the same order, which is to say: what a
-// server on the open internet survives with.  An embedded caller should
-// pass its own, an order of magnitude smaller.
+// These are of the order nginx and Go's `net/http` use for a server on
+// the open internet.
+//
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     println("${h1read.default_limits().max_head}")   // 65536
+// ```
 pub fn default_limits() -> H1Limits
-    todo("http-codec-nv.h1read.default_limits")
+    H1Limits { max_head: 65536, max_headers: 128, max_chunk: 1048576 }
 
 // embedded_limits is a head of 1 KiB, 16 fields and chunks of 512
-// bytes.
+// bytes, for a device with tens of kilobytes of memory.
 //
-// Named rather than left to each device caller to invent, because the
-// number that matters on a microcontroller is the one that fits beside
-// everything else in 64 KiB of RAM, and every caller inventing it
-// separately gets a different answer.
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     println("${h1read.embedded_limits().max_headers}")   // 16
+// ```
 pub fn embedded_limits() -> H1Limits
-    todo("http-codec-nv.h1read.embedded_limits")
+    H1Limits { max_head: 1024, max_headers: 16, max_chunk: 512 }
 
 // reader is a reader holding nothing, for one direction and one set of
 // limits.
-pub fn reader(role: H1Role, limits: H1Limits) -> H1Reader
-    todo("http-codec-nv.h1read.reader")
-
-// expect tells a client's reader the method of a request that has gone
-// out, so the response to it can be framed.
-//
-// Called once per request, in the order the requests were written —
-// which is the order the responses come back in, because HTTP/1.1
-// pipelining is the only ordering there is.  A `ReadsRequests` reader
-// ignores this.
-//
-// It is a function on the reader and not a field on `feed` because a
-// pipelining client sends three requests before the first response
-// arrives, and the queue of methods has to live somewhere the reader
-// can reach.
-pub fn expect(r: H1Reader, sent: H1Method) -> H1Reader
-    todo("http-codec-nv.h1read.expect")
-
-// feed adds bytes and takes one event, if the addition completed one.
-//
-// Drains ONE event.  A feed that completes three — a small request that
-// arrived in a single packet completes its head, its body and its end —
-// leaves two inside, and `take` is what gets them.  `drain` is that
-// loop written once.
 //
 // ```novo
 // use h1read
 //
 // fn main() [io]
 //     let r = h1read.reader(ReadsRequests, h1read.default_limits())
-//     match h1read.feed(r, [0x47 as u8, 0x45 as u8, 0x54 as u8])
+//     println("${h1read.pending_len(r)}")   // 0
+// ```
+pub fn reader(role: H1Role, limits: H1Limits) -> H1Reader
+    H1Reader {
+        role: role, limits: limits, pending: [], consumed: 0,
+        phase: PHASE_IDLE, remaining: 0, methods: [], closed: false,
+        no_body_status: 0 }
+
+// A copy of a reader with a new position in the message.
+fn at_phase(r: H1Reader, phase: Int, remaining: Int) -> H1Reader
+    H1Reader {
+        role: r.role, limits: r.limits, pending: r.pending, consumed: r.consumed,
+        phase: phase, remaining: remaining, methods: r.methods, closed: r.closed,
+        no_body_status: r.no_body_status }
+
+// A copy of a reader with its first `n` pending bytes consumed.
+fn consume(r: H1Reader, n: Int) -> H1Reader
+    H1Reader {
+        role: r.role, limits: r.limits, pending: r.pending[n:], consumed: r.consumed + n,
+        phase: r.phase, remaining: r.remaining, methods: r.methods, closed: r.closed,
+        no_body_status: r.no_body_status }
+
+// A copy of a reader with new pending bytes, unanswered methods, close
+// flag and remembered status.
+fn with_state(r: H1Reader, pending: [u8], methods: [H1Method], closed: Bool,
+              no_body_status: Int) -> H1Reader
+    H1Reader {
+        role: r.role, limits: r.limits, pending: pending, consumed: r.consumed,
+        phase: r.phase, remaining: r.remaining, methods: methods, closed: closed,
+        no_body_status: no_body_status }
+
+// expect tells a client's reader the method of a request that has gone
+// out, so that the response to it can be framed.
+//
+// Call it once per request, in the order the requests were written.
+// HTTP/1.1 answers requests in the order they arrived, so that is the
+// order the responses come back in.  A `ReadsRequests` reader keeps the
+// method and never reads it.
+//
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     let r = h1read.expect(h1read.reader(ReadsResponses, h1read.default_limits()), Head)
+//     println("${h1read.offset(r)}")   // 0
+// ```
+pub fn expect(r: H1Reader, sent: H1Method) -> H1Reader
+    with_state(r, r.pending, list.concat(r.methods, [sent]), r.closed, r.no_body_status)
+
+// feed adds bytes and takes one event, if the bytes completed one.
+//
+// A feed that completes several events, as a small request arriving in
+// one packet does, answers the first and keeps the rest buffered.
+// Call `take` until it answers `None` before feeding again.
+//
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     let r = h1read.reader(ReadsRequests, h1read.default_limits())
+//     match h1read.feed(r, [71 as u8, 69 as u8, 84 as u8])
 //         Ok(step) =>
 //             match step.event
 //                 None    => println("partial, as expected")
 //                 Some(_) => println("an event")
 //         Err(e)   => println(e.message())
 // ```
-pub fn feed(r: H1Reader, bytes: [u8]) -> Result<H1Step, H1DecodeError>
-    todo("http-codec-nv.h1read.feed")
+pub fn feed(r: H1Reader, bytes: [u8]) -> Result<H1Step, h1err.H1DecodeError>
+    take(with_state(r, list.concat(r.pending, bytes), r.methods, r.closed, r.no_body_status))
 
-// take takes one event if a complete one is already buffered, adding
-// nothing.
+// take takes one event if a complete one is buffered, adding no bytes.
 //
-// `event` is `None` when the buffer holds a prefix, and the reader
-// comes back unchanged.  A caller loops on this until `None` and then
-// goes back to its socket.
-pub fn take(r: H1Reader) -> Result<H1Step, H1DecodeError>
-    todo("http-codec-nv.h1read.take")
+// `event` is `None` when the reader holds only part of the next event.
+// A caller calls this until `None` and then goes back to its socket.
+//
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     let r = h1read.reader(ReadsRequests, h1read.default_limits())
+//     match h1read.take(r)
+//         Ok(step) => println("${step.event == None}")   // true
+//         Err(e)   => println(e.message())
+// ```
+pub fn take(r: H1Reader) -> Result<H1Step, h1err.H1DecodeError>
+    var cur = r
+    loop
+        let a = advance(cur)!
+        if a.event != None or not a.moved
+            return Ok(H1Step { reader: a.reader, event: a.event })
+        cur = a.reader
 
-// finish tells the reader the peer closed, and takes the last event.
+// finish tells the reader that the peer closed, and takes the next
+// event.
 //
-// This is not a formality.  A response framed `UntilClose` ENDS at the
-// close — the close is the framing — so its `MessageDone` exists only
-// if somebody says the close happened.  A close in the middle of any
-// other message is `MessageTruncated`, and a close between messages
-// gives `event: None` and no error, which is an ordinary end of
-// connection.
-pub fn finish(r: H1Reader) -> Result<H1Step, H1DecodeError>
-    todo("http-codec-nv.h1read.finish")
+// A response framed until the close ends there, so its `MessageDone`
+// comes from `finish`.  A close inside any other message is
+// `MessageTruncated`.  A close between messages answers `None` and no
+// error.  Body bytes still buffered come out first, so a caller keeps
+// calling `take` after `finish` until it answers `None`.
+//
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     match h1read.finish(h1read.reader(ReadsRequests, h1read.default_limits()))
+//         Ok(step) => println("${step.event == None}")   // true
+//         Err(e)   => println(e.message())
+// ```
+pub fn finish(r: H1Reader) -> Result<H1Step, h1err.H1DecodeError>
+    take(with_state(r, r.pending, r.methods, true, r.no_body_status))
 
-// pending_len is how many bytes the reader is holding.
+// pending_len is how many bytes the reader holds that are not yet part
+// of an event.
 //
-// For a caller that bounds its own buffering, and for a supervisor that
-// wants to notice a peer sitting on half a message forever.  The
-// limits bound this too, but a caller may want to act before they do.
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     let r = h1read.reader(ReadsRequests, h1read.default_limits())
+//     match h1read.feed(r, [71 as u8, 69 as u8, 84 as u8])
+//         Ok(step) => println("${h1read.pending_len(step.reader)}")   // 3
+//         Err(e)   => println(e.message())
+// ```
 pub fn pending_len(r: H1Reader) -> Int
-    todo("http-codec-nv.h1read.pending_len")
+    list.len(r.pending)
 
-// offset is how many bytes this reader has consumed since it was made.
+// offset is how many bytes this reader has turned into events since it
+// was made.
 //
-// The same counter every `H1DecodeError`'s `at` is measured in, so a
-// caller can report a fault's position on a connection without keeping
-// a count of its own.
+// It is the counter every `H1DecodeError`'s offset is measured in.
+//
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     println("${h1read.offset(h1read.reader(ReadsRequests, h1read.default_limits()))}")   // 0
+// ```
 pub fn offset(r: H1Reader) -> Int
-    todo("http-codec-nv.h1read.offset")
+    r.consumed
 
-// message_open says whether a message is in progress — a head has
-// arrived and its `MessageDone` has not.
+// message_open says whether a message is in progress: its head has
+// come out and its `MessageDone` has not.
 //
-// A caller closing a connection between messages is doing something
-// ordinary; a caller closing one mid-message has to say so to the other
-// end, which is the difference this answers.
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     println("${h1read.message_open(h1read.reader(ReadsRequests, h1read.default_limits()))}")   // false
+// ```
 pub fn message_open(r: H1Reader) -> Bool
-    todo("http-codec-nv.h1read.message_open")
+    r.phase != PHASE_IDLE
 
 // drain reads from `src` until one message ends or the source stops
-// giving, and returns every event that came out.
+// giving, and answers every event that came out.
 //
-// THE LOAD-BEARING SIGNATURE OF THIS PACKAGE.  `S: Read[e]` binds the
-// effect parameter of the standard library's `Read` trait and the
-// clause is `[e]`, so the row means "whatever the impl behind `S`
-// supplies": `[io, net]` against a `TcpStream`, nothing against an
-// in-memory `Buffer`.  Naming `[e]` has not spent an effect — it has
-// said "whatever you hand me" — which is what lets a `core` package
-// offer the read-until-done loop instead of making every caller write
-// it (SPEC § 5.6, and `docs/publishing.md` § Design calls this the
-// direct shape for a core package taking a stream from its host).
+// `S: Read[e]` binds the effect parameter of the standard library's
+// `Read` trait, so `drain` costs what the source costs: `[io, net]` for
+// a `TcpStream` and nothing for an in-memory `Buffer` (SPEC section
+// 5.6).  A read that answers no bytes, or an I/O error, is taken as the
+// peer closing, and the reader is finished.  Bytes read past the end of
+// the message stay in the reader that comes back.
 //
-// It is the same machine as `feed` and `take` with the pump written
-// once, here, instead of once per caller.  Use `feed` when the bytes
-// arrive from somewhere this does not fit — a TLS record layer, a
-// decompressor, a browser's fetch — and use this otherwise.
+// ```novo
+// use h1read
 //
-// It is the ONLY function in the package with a row, and the only one
-// that could have had one: everything else takes bytes the caller
-// already holds.
-pub fn drain<S: Read[e]>(r: H1Reader, src: S) -> Result<H1Drained, H1DecodeError> [e]
-    todo("http-codec-nv.h1read.drain")
+// fn main() [io]
+//     let src = Buffer.from_str("GET / HTTP/1.1\r\nHost: e\r\n\r\n")
+//     match h1read.drain(h1read.reader(ReadsRequests, h1read.default_limits()), src)
+//         Ok(d)  => println("${list.len(d.events)} events")   // 2 events
+//         Err(e) => println(e.message())
+//     src.drop()
+// ```
+pub fn drain<S: Read[e]>(r: H1Reader, src: S) -> Result<H1Drained, h1err.H1DecodeError> [e]
+    var cur = r
+    var events: [H1Event] = []
+    loop
+        let step = take(cur)!
+        cur = step.reader
+        match step.event
+            Some(ev) =>
+                events = list.push(events, ev)
+                if ev == MessageDone
+                    return Ok(H1Drained { reader: cur, events: events })
+            None     =>
+                if cur.closed
+                    return Ok(H1Drained { reader: cur, events: events })
+                var got: [u8] = []
+                match src.read(DRAIN_READ)
+                    Ok(chunk) =>
+                        got = bytes.to_byte_list(chunk)
+                    Err(_)    =>
+                        got = []
+                if list.len(got) == 0
+                    cur = with_state(cur, cur.pending, cur.methods, true, cur.no_body_status)
+                else
+                    cur = with_state(cur,
+                        list.concat(cur.pending, got),
+                        cur.methods,
+                        cur.closed,
+                        cur.no_body_status)
 
 // parse_head reads one complete head out of a byte list, for a caller
-// that already has the whole thing.
+// that already holds it.
 //
-// The shape `std.http`'s `http_server_parse_head` has, with two
-// differences that are the reason this package exists: it takes bytes
-// rather than a `Str`, so a head with an invalid UTF-8 byte in it is
-// refused rather than mangled on the way in; and it returns a reason
-// with an offset rather than `None`.
+// It reads the head only and computes no framing.  The reader in the
+// answer has consumed the head and nothing after it, so
+// `h1read.offset` is the head's length and the body starts there.  A
+// list holding only part of a head answers `None`.
 //
-// It reads the HEAD only.  Whatever follows the blank line is the body,
-// and framing it is `h1msg.request_framing`'s job — which is why this
-// returns the byte count it consumed alongside the head.
-pub fn parse_head(bytes: [u8], role: H1Role, limits: H1Limits) -> Result<H1Step, H1DecodeError>
-    todo("http-codec-nv.h1read.parse_head")
+// ```novo
+// use h1read
+//
+// fn main() [io]
+//     let head = bytes.to_byte_list(bytes.from_str("GET / HTTP/1.1\r\nHost: e\r\n\r\n"))
+//     match h1read.parse_head(head, ReadsRequests, h1read.default_limits())
+//         Ok(step) => println("${h1read.offset(step.reader)} bytes")   // 27 bytes
+//         Err(e)   => println(e.message())
+// ```
+pub fn parse_head(bytes: [u8], role: H1Role,
+                  limits: H1Limits) -> Result<H1Step, h1err.H1DecodeError>
+    let r = with_state(reader(role, limits), bytes, [], false, 0)
+    let a = idle(r, true)!
+    Ok(H1Step { reader: a.reader, event: a.event })
+
+// ---------------------------------------------------------------------
+// The loop.  Each phase reads what it can from the pending bytes and
+// either produces an event, moves to another phase, or waits.
+
+// No event and no change: the reader waits for more bytes.
+fn wait(r: H1Reader) -> Result<H1Advance, h1err.H1DecodeError>
+    Ok(H1Advance { reader: r, event: None, moved: false })
+
+// No event, but the reader moved on and the loop continues.
+fn moved(r: H1Reader) -> Result<H1Advance, h1err.H1DecodeError>
+    Ok(H1Advance { reader: r, event: None, moved: true })
+
+// An event.
+fn emit(r: H1Reader, ev: H1Event) -> Result<H1Advance, h1err.H1DecodeError>
+    Ok(H1Advance { reader: r, event: Some(ev), moved: true })
+
+// One pass, by phase.
+fn advance(r: H1Reader) -> Result<H1Advance, h1err.H1DecodeError>
+    if r.phase == PHASE_DONE
+        return emit(at_phase(r, PHASE_IDLE, 0), MessageDone)
+    if r.phase == PHASE_FIXED or r.phase == PHASE_CHUNK_DATA
+        return body_bytes(r)
+    if r.phase == PHASE_UNTIL_CLOSE
+        return until_close(r)
+    if r.phase == PHASE_CHUNK_SIZE
+        return chunk_size(r)
+    if r.phase == PHASE_CHUNK_END
+        return chunk_end(r)
+    if r.phase == PHASE_TRAILERS
+        return trailers(r)
+    idle(r, false)
+
+// The byte at `i` of the pending bytes, as an `Int`.
+fn byte(r: H1Reader, i: Int) -> Int
+    r.pending[i] as Int
+
+// The text of bytes `lo` to `hi` of a list.
+fn text_of(buf: [u8], lo: Int, hi: Int) -> Str
+    let sb = str.builder_new_cap(hi - lo)
+    for i in lo..hi
+        str.builder_append_char(sb, buf[i] as Int)
+    let s = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    s
+
+// The index of the first line feed at or after `from`, or -1.
+fn find_lf(buf: [u8], from: Int) -> Int
+    let n = list.len(buf)
+    for i in from..n
+        if (buf[i] as Int) == '\n'
+            return i
+    -1
+
+// The end of the line ending at the line feed `lf`: the line feed
+// itself, or the carriage return before it.
+fn line_end(buf: [u8], lo: Int, lf: Int) -> Int
+    if lf > lo and (buf[lf - 1] as Int) == '\r'
+        lf - 1
+    else
+        lf
+
+// The index just past the blank line that ends a section starting at
+// `from`, or -1 when the section has not ended yet.  A line ends at a
+// line feed, with or without a carriage return before it (RFC 9112
+// section 2.2).
+fn section_end(buf: [u8], from: Int) -> Int
+    var lo = from
+    loop
+        let lf = find_lf(buf, lo)
+        if lf < 0
+            return -1
+        if line_end(buf, lo, lf) == lo
+            return lf + 1
+        lo = lf + 1
+
+// How many carriage returns and line feeds a list starts with.
+fn line_breaks(buf: [u8]) -> Int
+    for i in 0..list.len(buf)
+        let b = buf[i] as Int
+        if b != '\r' and b != '\n'
+            return i
+    list.len(buf)
+
+// The index of the first byte from `lo` that is not a `tchar`, or `hi`.
+fn token_end(buf: [u8], lo: Int, hi: Int) -> Int
+    for i in lo..hi
+        if not h1msg.is_tchar(buf[i] as Int)
+            return i
+    hi
+
+// The index of the first byte from `lo` that is not a space or a tab,
+// or `hi`.
+fn ows_end(buf: [u8], lo: Int, hi: Int) -> Int
+    for i in lo..hi
+        let b = buf[i] as Int
+        if b != ' ' and b != '\t'
+            return i
+    hi
+
+// The index of the first byte from 0 that is not a hexadecimal digit,
+// or `hi`.
+fn hex_end(buf: [u8], hi: Int) -> Int
+    for i in 0..hi
+        if hex_value(buf[i] as Int) < 0
+            return i
+    hi
+
+// Between messages: skip empty lines, check the start of the start
+// line as it arrives, and parse the head once its blank line is in.
+//
+// `head_only` is `parse_head`'s mode: the head is answered and no
+// framing is computed.
+fn idle(r: H1Reader, head_only: Bool) -> Result<H1Advance, h1err.H1DecodeError>
+    let n = list.len(r.pending)
+    let skip = line_breaks(r.pending)
+    if skip > 0
+        return moved(consume(r, skip))
+    if n == 0
+        return wait(r)
+    early_check(r)!
+    let end = section_end(r.pending, 0)
+    if end < 0
+        if r.closed
+            return Err(MessageTruncated(r.consumed + n))
+        if n > r.limits.max_head
+            return Err(HeadTooLarge(r.consumed + r.limits.max_head, r.limits.max_head))
+        return wait(r)
+    if end > r.limits.max_head
+        return Err(HeadTooLarge(r.consumed + r.limits.max_head, r.limits.max_head))
+    match r.role
+        ReadsRequests  => request_head(r, end, head_only)
+        ReadsResponses => response_head(r, end, head_only)
+
+// Refuses a start line as soon as its first bytes are wrong, rather
+// than after a whole head of garbage.  A request line starts with a
+// method token and a space.  A status line starts with `HTTP/`, and
+// anything else after a response that may not have a body is that
+// body.
+fn early_check(r: H1Reader) -> Result<Unit, h1err.H1DecodeError>
+    let n = list.len(r.pending)
+    match r.role
+        ReadsRequests  =>
+            for i in 0..n
+                let b = byte(r, i)
+                if b == ' '
+                    if i == 0
+                        return Err(BadMethodToken(r.consumed))
+                    return Ok(())
+                if b == '\r' or b == '\n'
+                    return Err(BadStartLine(r.consumed))
+                if not h1msg.is_tchar(b)
+                    return Err(BadMethodToken(r.consumed + i))
+            Ok(())
+        ReadsResponses =>
+            let prefix = "HTTP/"
+            var seen = n
+            if seen > 5
+                seen = 5
+            for i in 0..seen
+                if byte(r, i) != str.byte_at_or(prefix, i, 0)
+                    if r.no_body_status > 0
+                        return Err(BodyNotAllowed(r.consumed, r.no_body_status))
+                    return Err(BadStartLine(r.consumed + i))
+            Ok(())
+
+// The version a start line names, or `None`.
+fn version_of(buf: [u8], lo: Int, hi: Int) -> ?H1Version
+    let t = text_of(buf, lo, hi)
+    if t == "HTTP/1.1"
+        return Some(Http11)
+    if t == "HTTP/1.0"
+        return Some(Http10)
+    None
+
+// The index of the first space in `lo` to `hi`, or -1.
+fn find_space(buf: [u8], lo: Int, hi: Int) -> Int
+    for i in lo..hi
+        if (buf[i] as Int) == ' '
+            return i
+    -1
+
+// Parses a request head of `end` bytes and moves the reader past it.
+fn request_head(r: H1Reader, end: Int, head_only: Bool) -> Result<H1Advance, h1err.H1DecodeError>
+    let buf = r.pending
+    let base = r.consumed
+    let lf = find_lf(buf, 0)
+    let hi = line_end(buf, 0, lf)
+    // The early check has seen a method and a space.
+    let sp1 = find_space(buf, 0, hi)
+    let sp2 = find_space(buf, sp1 + 1, hi)
+    if sp2 < 0
+        return Err(BadStartLine(base + hi))
+    let method = h1msg.method_of(text_of(buf, 0, sp1)) ?? Get
+    let target = text_of(buf, sp1 + 1, sp2)
+    if h1msg.target_form(target, method) == None
+        return Err(BadTargetForm(base + sp1 + 1))
+    let version = version_of(buf, sp2 + 1, hi)
+    if version == None
+        return Err(BadHttpVersion(base + sp2 + 1))
+    let fields = parse_fields(buf, lf + 1, end, r.limits, base, false)!
+    let req = H1Request {
+        method: method, target: target, version: version ?? Http11,
+        headers: h1msg.headers(fields) }
+    let next = consume(r, end)
+    if head_only
+        return emit(next, RequestHead(req))
+    let framing = h1msg.request_framing_at(req, base)!
+    emit(framed(next, framing), RequestHead(req))
+
+// Parses a response head of `end` bytes and moves the reader past it.
+fn response_head(r: H1Reader, end: Int, head_only: Bool) -> Result<H1Advance, h1err.H1DecodeError>
+    let buf = r.pending
+    let base = r.consumed
+    let lf = find_lf(buf, 0)
+    let hi = line_end(buf, 0, lf)
+    var sp1 = find_space(buf, 0, hi)
+    if sp1 < 0
+        sp1 = hi
+    let version = version_of(buf, 0, sp1)
+    if version == None
+        return Err(BadHttpVersion(base))
+    let status = status_of(buf, sp1, hi)
+    if status < 0
+        return Err(BadStatusCode(base + sp1))
+    var reason = ""
+    if sp1 + 4 < hi
+        let bad = first_bad_reason_byte(buf, sp1 + 5, hi)
+        if bad >= 0
+            return Err(BadStartLine(base + bad))
+        reason = text_of(buf, sp1 + 5, hi)
+    let fields = parse_fields(buf, lf + 1, end, r.limits, base, false)!
+    let resp = H1Response {
+        version: version ?? Http11, status: status, reason: reason,
+        headers: h1msg.headers(fields) }
+    let next = consume(r, end)
+    if head_only
+        return emit(next, ResponseHead(resp))
+    if list.len(r.methods) == 0
+        return Err(MessageStillOpen(base))
+    let sent = r.methods[0]
+    let methods = answered(r.methods, status)
+    let framing = h1msg.response_framing_at(sent, resp, base)!
+    var remembered = 0
+    if h1msg.status_forbids_body(status) or h1msg.same_method(sent, Head)
+        remembered = status
+    let after = with_state(next, next.pending, methods, next.closed, remembered)
+    emit(framed(after, framing), ResponseHead(resp))
+
+// The unanswered methods after a response with this status.  A 1xx
+// other than 101 is interim, and the request it answers is still
+// waiting for its final response.
+fn answered(methods: [H1Method], status: Int) -> [H1Method]
+    if h1msg.is_informational(status) and status != 101
+        return methods[:]
+    methods[1:]
+
+// The status of a status line whose version ends at `sp`, or -1.
+//
+// Three digits from 100 to 599, then a space or the end of the line.
+// RFC 9112 section 4 requires the space, and a recipient reading a
+// status line with no reason phrase and no space accepts it, as h11
+// and httparse do.
+fn status_of(buf: [u8], sp: Int, hi: Int) -> Int
+    if sp + 4 > hi
+        return -1
+    if sp + 4 < hi and (buf[sp + 4] as Int) != ' '
+        return -1
+    var v = 0
+    for i in sp + 1..sp + 4
+        let d = buf[i] as Int
+        if d < '0' or d > '9'
+            return -1
+        v = v * 10 + (d - '0')
+    if v < 100 or v > 599
+        return -1
+    v
+
+// The index of the first byte of a reason phrase that RFC 9112 section
+// 4 does not allow (anything but a tab, a space, visible ASCII and
+// bytes from 0x80 up), or -1.
+fn first_bad_reason_byte(buf: [u8], lo: Int, hi: Int) -> Int
+    for i in lo..hi
+        if not h1msg.is_field_byte(buf[i] as Int)
+            return i
+    -1
+
+// The header or trailer fields between `lo` and the section's blank
+// line at `end`.
+//
+// A field line is a token, a colon, optional whitespace, the value and
+// optional whitespace (RFC 9112 section 5).  In a trailer section a
+// fault is `BadTrailer`, and the three fields RFC 9110 section 6.5.1
+// forbids there are refused.
+fn parse_fields(buf: [u8], lo: Int, end: Int, limits: H1Limits, base: Int,
+                trailer: Bool) -> Result<[H1Header], h1err.H1DecodeError>
+    var out: [H1Header] = []
+    var at = lo
+    loop
+        let lf = find_lf(buf, at)
+        let hi = line_end(buf, at, lf)
+        if hi == at
+            return Ok(out)
+        if list.len(out) == limits.max_headers
+            return Err(TooManyHeaders(base + at, limits.max_headers))
+        let f = parse_field(buf, at, hi, base, trailer)!
+        out = list.push(out, f)
+        at = lf + 1
+
+// One field line from `lo` to `hi`.
+fn parse_field(buf: [u8], lo: Int, hi: Int, base: Int,
+               trailer: Bool) -> Result<H1Header, h1err.H1DecodeError>
+    let colon = token_end(buf, lo, hi)
+    if colon == lo or colon == hi or (buf[colon] as Int) != ':'
+        if trailer
+            return Err(BadTrailer(base + lo, text_of(buf, lo, colon)))
+        return Err(BadHeaderName(base + colon))
+    let name = text_of(buf, lo, colon)
+    let vlo = ows_end(buf, colon + 1, hi)
+    var vhi = hi
+    while vhi > vlo and ((buf[vhi - 1] as Int) == ' ' or (buf[vhi - 1] as Int) == '\t')
+        vhi = vhi - 1
+    let bad = first_bad_reason_byte(buf, vlo, vhi)
+    if bad >= 0
+        if trailer
+            return Err(BadTrailer(base + bad, name))
+        return Err(BadHeaderValue(base + bad))
+    if trailer and (h1msg.name_eq(name, "Content-Length") or h1msg.name_eq(name, "Transfer-Encoding") or h1msg.name_eq(name, "Host"))
+        return Err(BadTrailer(base + lo, name))
+    Ok(H1Header { name: name, value: text_of(buf, vlo, vhi) })
+
+// The reader after a head, in the phase its framing starts.
+fn framed(r: H1Reader, f: H1Framing) -> H1Reader
+    match f
+        NoBody         => at_phase(r, PHASE_DONE, 0)
+        FixedLength(n) =>
+            if n == 0
+                at_phase(r, PHASE_DONE, 0)
+            else
+                at_phase(r, PHASE_FIXED, n)
+        ChunkedBody    => at_phase(r, PHASE_CHUNK_SIZE, 0)
+        UntilClose     => at_phase(r, PHASE_UNTIL_CLOSE, 0)
+
+// Body bytes of a fixed-length body or of one chunk: as many as are
+// buffered, up to what is still due.
+fn body_bytes(r: H1Reader) -> Result<H1Advance, h1err.H1DecodeError>
+    let n = list.len(r.pending)
+    if n == 0
+        if r.closed
+            return Err(MessageTruncated(r.consumed))
+        return wait(r)
+    var take_n = r.remaining
+    if n < take_n
+        take_n = n
+    let data = r.pending[:take_n]
+    let left = r.remaining - take_n
+    var next_phase = r.phase
+    if left == 0
+        if r.phase == PHASE_FIXED
+            next_phase = PHASE_DONE
+        else
+            next_phase = PHASE_CHUNK_END
+    emit(at_phase(consume(r, take_n), next_phase, left), BodyBytes(data))
+
+// Body bytes of a body that ends when the connection does.
+fn until_close(r: H1Reader) -> Result<H1Advance, h1err.H1DecodeError>
+    let n = list.len(r.pending)
+    if n > 0
+        return emit(consume(r, n), BodyBytes(r.pending))
+    if r.closed
+        return emit(at_phase(r, PHASE_IDLE, 0), MessageDone)
+    wait(r)
+
+// The value of a hexadecimal digit, or -1.
+fn hex_value(b: Int) -> Int
+    if b >= '0' and b <= '9'
+        return b - '0'
+    if b >= 'a' and b <= 'f'
+        return b - 'a' + 10
+    if b >= 'A' and b <= 'F'
+        return b - 'A' + 10
+    -1
+
+// A chunk-size line: hexadecimal digits, optional whitespace, and an
+// optional chunk extension, which is skipped (RFC 9112 section 7.1.1).
+fn chunk_size(r: H1Reader) -> Result<H1Advance, h1err.H1DecodeError>
+    let buf = r.pending
+    let lf = find_lf(buf, 0)
+    if lf < 0
+        if r.closed
+            return Err(MessageTruncated(r.consumed + list.len(buf)))
+        if list.len(buf) > r.limits.max_head
+            return Err(BadChunkSize(r.consumed))
+        return wait(r)
+    let hi = line_end(buf, 0, lf)
+    let digits = hex_end(buf, hi)
+    if digits == 0
+        return Err(BadChunkSize(r.consumed))
+    var size = 0
+    for d in 0..digits
+        size = size * 16 + hex_value(buf[d] as Int)
+        if size > r.limits.max_chunk
+            return Err(ChunkTooLarge(r.consumed, r.limits.max_chunk))
+    let i = ows_end(buf, digits, hi)
+    if i < hi
+        if (buf[i] as Int) != ';'
+            return Err(BadChunkSize(r.consumed + i))
+        let bad = first_bad_reason_byte(buf, i, hi)
+        if bad >= 0
+            return Err(BadChunkSize(r.consumed + bad))
+    let next = consume(r, lf + 1)
+    if size == 0
+        return moved(at_phase(next, PHASE_TRAILERS, 0))
+    moved(at_phase(next, PHASE_CHUNK_DATA, size))
+
+// The line break after a chunk's data.
+fn chunk_end(r: H1Reader) -> Result<H1Advance, h1err.H1DecodeError>
+    let n = list.len(r.pending)
+    if n == 0 or n == 1 and byte(r, 0) == '\r'
+        if r.closed
+            return Err(MessageTruncated(r.consumed + n))
+        return wait(r)
+    if byte(r, 0) == '\n'
+        return moved(at_phase(consume(r, 1), PHASE_CHUNK_SIZE, 0))
+    if byte(r, 0) == '\r' and byte(r, 1) == '\n'
+        return moved(at_phase(consume(r, 2), PHASE_CHUNK_SIZE, 0))
+    Err(BadChunkTerminator(r.consumed))
+
+// The trailer section after the last chunk, and the blank line that
+// ends the body.
+fn trailers(r: H1Reader) -> Result<H1Advance, h1err.H1DecodeError>
+    let buf = r.pending
+    let end = section_end(buf, 0)
+    if end < 0
+        if r.closed
+            return Err(MessageTruncated(r.consumed + list.len(buf)))
+        if list.len(buf) > r.limits.max_head
+            return Err(HeadTooLarge(r.consumed + r.limits.max_head, r.limits.max_head))
+        return wait(r)
+    if end > r.limits.max_head
+        return Err(HeadTooLarge(r.consumed + r.limits.max_head, r.limits.max_head))
+    let fields = parse_fields(buf, 0, end, r.limits, r.consumed, true)!
+    let next = at_phase(consume(r, end), PHASE_DONE, 0)
+    if list.len(fields) == 0
+        return moved(next)
+    emit(next, Trailers(h1msg.headers(fields)))

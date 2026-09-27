@@ -1,199 +1,259 @@
-// h1err.nv — every way an HTTP/1.1 message can refuse to be read, and
-// WHERE.
+// h1err.nv — why a message could not be read, or could not be written.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// `H1DecodeError` is a fault in what the peer sent.  `H1EncodeError` is
+// a message the calling program asked this package to write that
+// HTTP/1.1 does not allow.  They are two types because they are
+// answered in different places: the first is a log line and often a
+// 400, the second is a defect in the program.
 //
-// WHY EVERY VARIANT CARRIES A BYTE OFFSET
+// Every decode refusal carries the byte offset the reader stopped at.
+// It is counted from the first byte the reader was ever given, not
+// from the start of the chunk that held the fault, and `h1read.offset`
+// is the same counter.
 //
-// A malformed HTTP message is nearly always somebody else's: a proxy
-// that folded a header, a client library that wrote a length it then
-// did not honour, a script that sent CR without LF.  The only thing
-// that makes such a report actionable is the byte the parser stopped
-// at, because that is what a person pastes into `xxd -s` or a capture
-// tool's offset box.  A parser that returns a reason and makes the
-// caller carry the cursor gets a caller that does not carry the cursor,
-// so `at` is in the variant rather than beside it.
-//
-// `at` is counted from the FIRST BYTE THE READER WAS EVER GIVEN, not
-// from the start of the chunk that happened to contain the fault.  A
-// chunk boundary is an artefact of how the host read its socket and it
-// must not show up in an error a person reads; `h1read.offset` is the
-// same counter, so a caller can print "byte 4,812 of this connection"
-// without keeping a count of its own.
-//
-// DECODING AND ENCODING ARE TWO QUESTIONS, SO THEY ARE TWO TYPES
-//
-// `H1DecodeError` is "the peer sent something HTTP/1.1 does not allow".
-// `H1EncodeError` is "you asked me to write something HTTP/1.1 does not
-// allow" — a body on a 204, a Content-Length beside a
-// Transfer-Encoding, a header value with a newline in it.  They are
-// different types because they have different audiences: the first is a
-// log line and possibly a 400, the second is a bug in the program that
-// called this package, and a caller that had to `match` one enum for
-// both would be writing arms it can never reach.
-//
-// Neither of them means "wait for more bytes".  That is
-// `h1read.H1Step` with `event: None`, which is not an error at all —
-// the same distinction `hci-codec-nv` draws between `Scan` and
-// `DecodeError`, for the same reason.
+// Neither type means "wait for more bytes".  That answer is a step
+// whose `event` is `None`, and it is not an error.
 
 // H1DecodeError is why a byte stream is not a well-formed HTTP/1.1
 // message, and at which byte the reader gave up.
 //
-// The names are RFC 9112's subject matter rather than a parser's
-// internal states, so a caller can map them onto the status code it
-// wants to answer with: everything here except `MessageTruncated` and
-// `BodyNotAllowed` is a 400, `HeadTooLarge` is a 431, and
-// `MessageTruncated` has no answer because the connection is already
-// gone.
+// `status_for` maps each refusal to the status a server answers it
+// with.
 //
 // ```novo
 // use h1err
 //
-// fn report(e: H1DecodeError) -> Str
-//     "byte ${h1err.offset_of(e)}: ${e.message()}"
+// fn main() [io]
+//     let e = BadStartLine(17)
+//     println("byte ${h1err.offset_of(e)}: ${e.message()}")
 // ```
 pub enum H1DecodeError
     // The first line is neither `method SP target SP version` nor
-    // `version SP status SP reason` (RFC 9112 § 3, § 4).
+    // `version SP status SP reason` (RFC 9112 sections 3 and 4).
     BadStartLine(at: Int)
-    // A method token with a character outside `tchar` in it.  HTTP
-    // methods are case-SENSITIVE, so a lowercase `get` is this and not
-    // a `Get` — the refusal is deliberate, because a server that
-    // accepted it would disagree with every other server about what
-    // the request was.
+    // A method with a byte that is not a `tchar` in it, or an empty
+    // one.  Methods are case-sensitive, so `get` is a legal extension
+    // method and not this refusal.
     BadMethodToken(at: Int)
-    // A request target that is none of RFC 9112 § 3.2's four forms.
+    // A request target with none of the four shapes of RFC 9112
+    // section 3.2, or a shape its method may not use.
     BadTargetForm(at: Int)
-    // A version that is not `HTTP/1.0` or `HTTP/1.1`.  `HTTP/2` and
-    // `HTTP/3` arrive as this too: they are not this package's wire
-    // format, and pretending to parse one would be worse than refusing.
+    // A version other than `HTTP/1.0` and `HTTP/1.1`.  `HTTP/2` and
+    // `HTTP/3` arrive as this.
     BadHttpVersion(at: Int)
-    // A status that is not three ASCII digits in `100 ..= 599`.
+    // A status that is not three ASCII digits from 100 to 599.
     BadStatusCode(at: Int)
-    // A header name with a character outside `tchar`, or an empty one.
-    // Also what obs-fold — a continuation line beginning with a space,
-    // deprecated by RFC 9112 § 5.2 — arrives as, because the folded
-    // line's first token is not a name.
+    // A field name with a byte that is not a `tchar`, an empty one, or
+    // whitespace between the name and the colon.  A line folded onto
+    // the one before it (obs-fold, RFC 9112 section 5.2) arrives as
+    // this, because its first byte is a space.
     BadHeaderName(at: Int)
-    // A header value containing a bare CR, a LF or a NUL.  This is the
-    // response-splitting defence and it is not optional: a value that
-    // can contain a newline is a value that can forge a second message.
+    // A field value holding a carriage return, a line feed, a NUL or
+    // another control character.  A value that could hold a line
+    // break could forge a second field.
     BadHeaderValue(at: Int)
-    // The head — start line and headers together — passed
-    // `H1Limits.max_head` before its terminating blank line.  Answer
-    // 431.
+    // The start line and header section together passed
+    // `H1Limits.max_head` before the blank line that ends them.
     HeadTooLarge(at: Int, cap: Int)
-    // More header fields than `H1Limits.max_headers` allows.
+    // More fields in one header or trailer section than
+    // `H1Limits.max_headers` allows.
     TooManyHeaders(at: Int, cap: Int)
-    // A `Content-Length` that is not a bare non-negative decimal, or a
-    // repeated one whose copies disagree.  `text` is the value as it
-    // stood, so the message can quote what was actually sent.
+    // A `Content-Length` that is not a run of decimal digits, or copies
+    // that disagree.  `text` is every copy, joined with commas.
     BadContentLength(at: Int, text: Str)
-    // `Content-Length` and `Transfer-Encoding` both present, or two
-    // `Transfer-Encoding` values that disagree.  RFC 9112 § 6.1 says a
-    // recipient MUST refuse: accepting one is the request-smuggling
-    // bug, and it is a refusal rather than a preference for that
-    // reason.
+    // `Content-Length` and `Transfer-Encoding` both present, or
+    // `chunked` named twice.  RFC 9112 section 6.1 says a recipient
+    // treats the first as an error, because two hops that read it
+    // differently disagree about where the message ends.
     ConflictingFraming(at: Int)
-    // A `Transfer-Encoding` naming a coding this package does not
-    // apply.  Only `chunked` is framing; `gzip` and friends are content
-    // codings a caller decompresses AFTER this package has framed the
-    // message.
+    // A `Transfer-Encoding` naming a coding other than `chunked`, which
+    // is the only coding this package applies.
     UnsupportedTransferCoding(at: Int, coding: Str)
-    // A chunk-size line that is not hexadecimal, or a chunk extension
-    // this package cannot skip.
+    // A chunk-size line that is not hexadecimal, or that carries a
+    // chunk extension with a control character in it.
     BadChunkSize(at: Int)
     // A chunk longer than `H1Limits.max_chunk`.
     ChunkTooLarge(at: Int, cap: Int)
-    // A chunk not followed by the CRLF RFC 9112 § 7.1 requires, or a
-    // last-chunk not followed by its terminating CRLF.
+    // Chunk data not followed by the line break RFC 9112 section 7.1
+    // requires.
     BadChunkTerminator(at: Int)
-    // A trailer section that broke one of the header rules, or a
-    // trailer field the RFC forbids in one (`Content-Length`,
-    // `Transfer-Encoding`, `Host`).
+    // A trailer field that breaks a header rule, or one of the three
+    // RFC 9110 section 6.5.1 forbids in a trailer section:
+    // `Content-Length`, `Transfer-Encoding` and `Host`.  `name` is the
+    // field name, or the text of the line when it has no colon.
     BadTrailer(at: Int, name: Str)
-    // The peer closed while a message was still open.  Not a fault in
-    // what arrived — what arrived was fine and there was not enough of
-    // it — which is why it is the one variant a caller may reasonably
-    // treat as an ordinary end of connection when the framing was
-    // `UntilClose`.
+    // The peer closed while a message was still open.
     MessageTruncated(at: Int)
-    // A response the caller must not have a body for arrived with one:
-    // a 1xx, a 204, a 304, or any response to a HEAD.  See
-    // `h1msg.status_forbids_body`, which is the same rule as a
-    // predicate.
+    // A response that may not have a body was followed by bytes that do
+    // not begin another response: a body sent after a 1xx, 204 or 304,
+    // or after the answer to HEAD.  `status` is that response's status.
     BodyNotAllowed(at: Int, status: Int)
-    // The reader was asked for the next message and the previous one is
-    // still open.  A caller's sequencing bug rather than the peer's,
-    // and named separately so it is not logged as a peer fault.
+    // A client's reader received a response before `h1read.expect` told
+    // it the method of the request it answers.
     MessageStillOpen(at: Int)
 
-// message renders the refusal as one line of prose, for a caller that
-// logs rather than branches.
+// message renders the refusal as one line, for a caller that logs
+// rather than branches.
 //
-// `Result<_, H1DecodeError>` requires it: SPEC § 3.4 admits a `Result`
-// error type only if it implements `Error`.
+// ```novo
+// use h1err
+//
+// fn main() [io]
+//     println(ConflictingFraming(40).message())
+// ```
 impl Error for H1DecodeError
     fn message(self) -> Str
-        todo("http-codec-nv.h1err.H1DecodeError.message")
+        match self
+            BadStartLine(at)                      => "byte ${at}: the start line is not a request line or a status line"
+            BadMethodToken(at)                    => "byte ${at}: the method is not a token"
+            BadTargetForm(at)                     => "byte ${at}: the request target has no shape this method may use"
+            BadHttpVersion(at)                    => "byte ${at}: the version is not HTTP/1.0 or HTTP/1.1"
+            BadStatusCode(at)                     => "byte ${at}: the status is not three digits from 100 to 599"
+            BadHeaderName(at)                     => "byte ${at}: the field name is not a token"
+            BadHeaderValue(at)                    => "byte ${at}: the field value holds a control character"
+            HeadTooLarge(at, cap)                 => "byte ${at}: the head is longer than ${cap} bytes"
+            TooManyHeaders(at, cap)               => "byte ${at}: more than ${cap} fields"
+            BadContentLength(at, text)            => "byte ${at}: Content-Length \"${text}\" is not one length"
+            ConflictingFraming(at)                => "byte ${at}: the message is framed two ways at once"
+            UnsupportedTransferCoding(at, coding) => "byte ${at}: transfer coding \"${coding}\" is not chunked"
+            BadChunkSize(at)                      => "byte ${at}: the chunk size is not hexadecimal"
+            ChunkTooLarge(at, cap)                => "byte ${at}: the chunk is longer than ${cap} bytes"
+            BadChunkTerminator(at)                => "byte ${at}: the chunk data is not followed by a line break"
+            BadTrailer(at, name)                  => "byte ${at}: \"${name}\" may not be a trailer field"
+            MessageTruncated(at)                  => "byte ${at}: the connection closed inside a message"
+            BodyNotAllowed(at, status)            => "byte ${at}: a body follows a ${status} response that may not have one"
+            MessageStillOpen(at)                  => "byte ${at}: a response arrived before the reader was told which request it answers"
 
 // H1EncodeError is why a message this package was asked to write would
 // not have been legal HTTP/1.1.
 //
-// Every one of these is the calling PROGRAM's fault rather than a
-// peer's, which is why they are a separate type from `H1DecodeError`:
-// the two are answered in different places and by different people.
+// Each of these is a defect in the calling program rather than in a
+// peer.
+//
+// ```novo
+// use h1err
+//
+// fn main() [io]
+//     println(BodyForbiddenForStatus(204).message())
+// ```
 pub enum H1EncodeError
-    // A body was supplied for a response whose status forbids one.
-    // `h1msg.status_forbids_body` is the same rule asked in advance.
+    // A body was given for a response whose status forbids one.
+    // `h1msg.status_forbids_body` asks the same question in advance.
     BodyForbiddenForStatus(status: Int)
-    // A body was supplied for a response to a HEAD request.  Separate
-    // from the status rule because the status is perfectly ordinary —
-    // it is the request method that removes the body.
+    // A body was given for a response to HEAD.  The status is ordinary;
+    // the method removes the body.
     BodyForbiddenForHead
-    // The headers name both `Content-Length` and `Transfer-Encoding`,
-    // so the message would have been ambiguous on the wire.
+    // The headers name both `Content-Length` and `Transfer-Encoding`.
     FramingConflictToWrite
-    // A header name that is not a `tchar` token.
+    // A field name that is not a token.
     BadHeaderNameToWrite(name: Str)
-    // A header value containing CR, LF or NUL.  Refused rather than
-    // sanitised: a package that quietly stripped the newline would be
-    // deciding, on the program's behalf, that a forged header is
-    // acceptable if it is stripped.
+    // A field value that `h1msg.is_field_value` refuses.  `name` is the
+    // field's name.
     BadHeaderValueToWrite(name: Str)
-    // A method token that is not a `tchar` token.
+    // A method token that is not a token.
     BadMethodTokenToWrite(token: Str)
-    // A status outside `100 ..= 599`.
+    // A status outside 100 to 599.
     BadStatusCodeToWrite(status: Int)
-    // A request with no `Host` header at `HTTP/1.1`, which RFC 9112
-    // § 3.2 makes mandatory.
+    // A request at HTTP/1.1 with no `Host` field and a target that is
+    // not absolute-form, which RFC 9112 section 3.2 makes mandatory.
     MissingHost
-    // A `Content-Length` that disagrees with the body actually handed
-    // over.  `declared` is what the headers said, `actual` what arrived.
+    // A `Content-Length` that disagrees with the body given.
+    // `declared` is what the headers said and `actual` the body's
+    // length.
     LengthDisagreesWithBody(declared: Int, actual: Int)
+    // A request target holding a byte a target may not hold: a space, a
+    // control character, `#`, or a byte from 0x80 up.
+    BadTargetToWrite(target: Str)
+    // A reason phrase holding a control character other than a
+    // horizontal tab.
+    BadReasonToWrite(reason: Str)
+    // `h1write.chunk` was given no bytes.  A chunk of size zero ends
+    // the body, and `h1write.last_chunk` is the call that writes it.
+    EmptyChunkToWrite
+    // A trailer field RFC 9110 section 6.5.1 forbids:
+    // `Content-Length`, `Transfer-Encoding` or `Host`.
+    ForbiddenTrailerToWrite(name: Str)
 
-// message renders the refusal as one line of prose.
+// message renders the refusal as one line.
+//
+// ```novo
+// use h1err
+//
+// fn main() [io]
+//     println(MissingHost.message())
+// ```
 impl Error for H1EncodeError
     fn message(self) -> Str
-        todo("http-codec-nv.h1err.H1EncodeError.message")
+        match self
+            BodyForbiddenForStatus(status)            => "a ${status} response has no body"
+            BodyForbiddenForHead                      => "a response to HEAD has no body"
+            FramingConflictToWrite                    => "Content-Length and Transfer-Encoding may not both be written"
+            BadHeaderNameToWrite(name)                => "field name \"${name}\" is not a token"
+            BadHeaderValueToWrite(name)               => "the value of field \"${name}\" is not a legal field value"
+            BadMethodTokenToWrite(token)              => "method \"${token}\" is not a token"
+            BadStatusCodeToWrite(status)              => "status ${status} is not from 100 to 599"
+            MissingHost                               => "an HTTP/1.1 request needs a Host field or an absolute-form target"
+            LengthDisagreesWithBody(declared, actual) => "Content-Length says ${declared} and the body is ${actual} bytes"
+            BadTargetToWrite(_)                       => "the request target holds a byte a target may not hold"
+            BadReasonToWrite(_)                       => "the reason phrase holds a control character"
+            EmptyChunkToWrite                         => "a chunk needs at least one byte; last_chunk ends a body"
+            ForbiddenTrailerToWrite(name)             => "\"${name}\" may not be a trailer field"
 
 // offset_of is the byte a decode refusal stopped at, counted from the
 // first byte the reader was ever given.
 //
-// Every `H1DecodeError` variant has one, so this is total — there is no
-// `-1` case and a caller never has to ask whether the number means
-// anything.
-pub fn offset_of(e: H1DecodeError) -> Int
-    todo("http-codec-nv.h1err.offset_of")
-
-// status_for is the response status a server should answer a refusal
-// with, or `None` when there is nobody left to answer.
+// Every variant carries one.
 //
-// 400 for a malformed message, 431 for `HeadTooLarge` and
-// `TooManyHeaders`, 501 for `UnsupportedTransferCoding`, and `None` for
-// `MessageTruncated` and `MessageStillOpen` — the first because the
-// connection is gone, the second because the fault is the caller's own
-// and answering the peer would be answering the wrong party.
+// ```novo
+// use h1err
+//
+// fn main() [io]
+//     println("${h1err.offset_of(HeadTooLarge(1024, 1024))}")   // 1024
+// ```
+pub fn offset_of(e: H1DecodeError) -> Int
+    match e
+        BadStartLine(at)                 => at
+        BadMethodToken(at)               => at
+        BadTargetForm(at)                => at
+        BadHttpVersion(at)               => at
+        BadStatusCode(at)                => at
+        BadHeaderName(at)                => at
+        BadHeaderValue(at)               => at
+        HeadTooLarge(at, _)              => at
+        TooManyHeaders(at, _)            => at
+        BadContentLength(at, _)          => at
+        ConflictingFraming(at)           => at
+        UnsupportedTransferCoding(at, _) => at
+        BadChunkSize(at)                 => at
+        ChunkTooLarge(at, _)             => at
+        BadChunkTerminator(at)           => at
+        BadTrailer(at, _)                => at
+        MessageTruncated(at)             => at
+        BodyNotAllowed(at, _)            => at
+        MessageStillOpen(at)             => at
+
+// status_for is the status a server answers a refusal with, or `None`
+// when there is nobody to answer.
+//
+// 431 for `HeadTooLarge` and `TooManyHeaders`, 501 for
+// `UnsupportedTransferCoding`, and 400 for every other fault in a
+// request.  `MessageTruncated` answers `None` because the connection is
+// gone.  `BodyNotAllowed` and `MessageStillOpen` answer `None` because
+// only a client's reader produces them, and a client does not answer a
+// response.
+//
+// ```novo
+// use h1err
+//
+// fn main() [io]
+//     println("${h1err.status_for(HeadTooLarge(9000, 8192)) ?? 0}")   // 431
+// ```
 pub fn status_for(e: H1DecodeError) -> ?Int
-    todo("http-codec-nv.h1err.status_for")
+    match e
+        HeadTooLarge(_, _)              => Some(431)
+        TooManyHeaders(_, _)            => Some(431)
+        UnsupportedTransferCoding(_, _) => Some(501)
+        MessageTruncated(_)             => None
+        BodyNotAllowed(_, _)            => None
+        MessageStillOpen(_)             => None
+        _                               => Some(400)
