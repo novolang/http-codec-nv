@@ -14,12 +14,6 @@ request bodies this package frames.
 [http2-nv](https://novo-lang.org/packages/http2-nv) carries the same
 semantics over a different wire format.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What HTTP/1.1 is
 
 An HTTP message is a **head** followed by a **body**. The head is a
@@ -107,14 +101,9 @@ fn main() [io]
                     Trailers(_)      => println("the trailer section arrived")
                     MessageDone      => println("the message ended")
                     ResponseHead(_)  => println("a server's reader never sees one")
-        Err(e) => println("byte ${h1err.offset_of(e)}: ${e.message()}")
+        Err(e) => println(e.message())
     src.drop()
 ```
-
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: http-codec-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
 
 ## What the package contains
 
@@ -169,7 +158,8 @@ and forgets. Use this for a body that does not fit in memory.
    `HEAD` carries the `Content-Length` of the body it does not send (RFC
    9110 section 9.3.2). Call `expect` once per request, in the order the
    requests went out. A `ReadsResponses` reader that was never told
-   refuses with `MessageStillOpen` rather than guessing `Get`.
+   refuses the response with `MessageStillOpen` rather than guessing
+   `Get`.
 4. **`response_framing` takes the method for the same reason.** So does
    `h1write.response`, which refuses a body on the answer to a `HEAD` and
    a body on a status that forbids one.
@@ -187,11 +177,12 @@ and forgets. Use this for a body that does not fit in memory.
    and two in the response (RFC 9112 section 9.3). A client that reuses a
    connection it should not have gets its next request answered by the
    tail of the previous body.
-8. **Call `finish` when the peer closes.** A response framed until close
-   ends at the close, so its `MessageDone` exists only once somebody says
-   the close happened. A close in the middle of any other message is
-   `MessageTruncated`. A close between messages is neither an event nor
-   an error.
+8. **Call `finish` when the peer closes, then `take` until `None`.** A
+   response framed until close ends at the close, so its `MessageDone`
+   exists only once somebody says the close happened. A close in the
+   middle of any other message is `MessageTruncated`, at the offset of
+   the last byte that arrived. A close between messages is neither an
+   event nor an error.
 9. **`BodyBytes` is not a message boundary.** The reader hands over
    whatever it has, with chunk framing already removed. How many events
    one body produces depends on how the host read its socket.
@@ -202,17 +193,19 @@ and forgets. Use this for a body that does not fit in memory.
 11. **`get` returns the first value of a repeated field.** Use `get_all`
     for every value. Joining `Set-Cookie` values with commas produces a
     cookie nobody can parse.
-12. **Methods are case-sensitive** (RFC 9110 section 9). A lowercase
-    `get` is `BadMethodToken` and not `Get`. An unregistered token that
-    is otherwise legal arrives as `ExtensionMethod`, because RFC 9110
-    section 9 leaves the list open.
+12. **Methods are case-sensitive** (RFC 9110 section 9.1). A lowercase
+    `get` is a legal token and arrives as `ExtensionMethod("get")`, not
+    as `Get`. Any unregistered token arrives as `ExtensionMethod`,
+    because RFC 9110 section 9 leaves the list open. A method with a
+    byte that is not a token character is `BadMethodToken`.
 13. **Every refusal carries the byte it stopped at.** The count starts at
     the first byte the reader was ever given, not at the chunk that
     contained the fault. `h1read.offset` is the same counter.
 14. **`h1err.status_for` chooses the answer.** 400 for a malformed
     message, 431 for a head or a header count over the limit, 501 for an
-    unsupported transfer coding, and `None` when there is nobody left to
-    answer.
+    unsupported transfer coding, and `None` when there is nobody to
+    answer: the peer has gone, or the refusal came from a client's
+    reader. `h1write.error_head` writes that answer.
 15. **The limits are yours to set.** `default_limits` is a 64 KiB head,
     128 fields and 1 MiB chunks, which is what a server on the open
     internet survives with. `embedded_limits` is a 1 KiB head, 16 fields
@@ -224,6 +217,15 @@ and forgets. Use this for a body that does not fit in memory.
 17. **Stop feeding this package when `is_upgrade` answers true.** A 101,
     or a 2xx answering a `CONNECT`, hands the connection to another
     protocol. What follows on it is not HTTP/1.1.
+18. **Only `chunked` is a transfer coding here.** A `Transfer-Encoding`
+    that names any other coding, such as `gzip, chunked`, is refused
+    with `UnsupportedTransferCoding`, in a request and in a response.
+    `chunked` named twice is `ConflictingFraming`.
+19. **A line may end in a bare line feed.** RFC 9112 section 2.2 allows
+    a recipient to accept one, and h11 and httparse do. Empty lines
+    before a start line are skipped. A folded header line is refused
+    as `BadHeaderName`, and whitespace between a field name and its
+    colon is refused the same way (RFC 9112 sections 5.1 and 5.2).
 
 ## What is not included
 
@@ -241,12 +243,14 @@ and forgets. Use this for a body that does not fit in memory.
   HTTP/2.
 - **Connecting, waiting, retrying and pooling.** The package holds no
   socket and reads no clock. A host does all four.
-- **A proof that the package builds for a microcontroller.** No test in
-  this release builds for a device target. `Result<T, E>` cannot be
-  spelled at the embedded tier with a package's own error type, because
-  the `Error` trait is not in the prelude there. The toolchain defect is
-  `result-is-unusable-at-tier-embedded-no-error-trait`, and the
-  signatures keep their `Result` until it is fixed.
+- **A build for a microcontroller with no heap.** A head holds its
+  target and its fields as strings, and a reader holds the bytes of an
+  unfinished head in a list, so every module allocates. No test builds
+  the package for a device.
+- **Enforcing `Host`.** RFC 9112 section 3.2 says a server answers an
+  HTTP/1.1 request without `Host` with a 400. The reader passes such a
+  request on, and `h1msg.has(req.headers, "Host")` is the check.
+  `h1write.request` refuses to write one.
 
 ## Related packages
 
@@ -277,46 +281,31 @@ and forgets. Use this for a body that does not fit in memory.
 ## Tests
 
 ```bash
-novo test tests/h1msg_tests.nv       # 19 tests on the heads and the framing rules
-novo test tests/h1read_tests.nv      # 12 tests on the reader
-novo test tests/h1write_tests.nv     # 12 tests on the encoder
+novo test tests/h1msg_tests.nv          # the header section, methods, target forms and framing rules
+novo test tests/h1read_tests.nv         # the reader's calls one at a time
+novo test tests/h1wire_tests.nv         # whole messages, read whole, 3 bytes and 1 byte at a time
+novo test tests/h1write_tests.nv        # the encoders and what they refuse
+novo test tests/h1err_tests.nv          # every refusal's offset, message and status
+novo test tests/differential_tests.nv   # 120 responses, compared with Python's http.client
+bash tests/coverage.sh                  # line coverage over src/, merged across the suites
 ```
 
-The messages the suite asserts against are RFC 9110's and RFC 9112's own:
-the section 3 request line, the section 4 status line, the section 6
-framing rules, and the section 7.1 chunked body with its trailer section.
-The suite checks that a prefix is not an error, that a refusal names the
-byte it stopped at, that a response to `HEAD` frames as no body however
-long its `Content-Length` says it is, that both framing headers at once
-are refused, and that the encoder will not write a message the reader
-would refuse.
+The messages in `h1wire_tests.nv` are RFC 9112's and RFC 9110's own
+examples: the four request target forms of section 3.2, a chunked body
+with a chunk extension and a trailer section, a response to `HEAD`, a
+`100 Continue` before the final response, and a body framed by the
+close. Beside them are the cases the h11 and httparse suites test: a
+folded header line, whitespace before a colon, a bare line feed, empty
+lines before a request, and both framing headers at once. Every message
+is read in one piece, three bytes at a time and one byte at a time, and
+the three readings must agree, refusal offsets included.
 
-Two tests are decided by the compiler before the run starts. One holds
-`drain` over an in-memory `Buffer`, and would not compile if `drain` had
-spent an effect of its own instead of binding the caller's. The other
-calls `expect`, and would not compile if the method a client sent were
-not something the reader carries.
-
-The tests compile today and fail at run, each on the
-`not implemented: http-codec-nv.<module>.<fn>` panic that is its body.
-That is the expected state of an interface release. They turn green one
-at a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `h1msg.headers`, `.no_headers`, `.get`, `.get_all`, `.has`, `.set`, `.append`, `.remove`, `.fields_of`, `.field_count`, `.name_eq` | no |
-| `h1msg.is_token`, `.is_field_value`, `.method_token`, `.method_of`, `.version_text`, `.target_form` | no |
-| `h1msg.request_framing`, `.response_framing` | no |
-| `h1msg.status_forbids_body`, `.is_informational`, `.status_reason`, `.may_reuse`, `.wants_close`, `.is_upgrade` | no |
-| `h1read.default_limits`, `.embedded_limits`, `.reader`, `.expect` | no |
-| `h1read.feed`, `.take`, `.finish`, `.pending_len`, `.offset`, `.message_open`, `.parse_head` | no |
-| `h1read.drain` | no |
-| `h1write.request_head`, `.response_head`, `.request`, `.response` | no |
-| `h1write.with_content_length`, `.with_chunked`, `.chunk`, `.last_chunk` | no |
-| `h1write.continue_head`, `.switching_protocols_head`, `.error_head` | no |
-| `h1err.offset_of`, `.status_for`, and the `message` of both error types | no |
+`differential_tests.nv` is written by `tools/differential.py`. It builds
+120 responses from a seeded generator, with the three framings, repeated
+and mixed-case fields, optional whitespace and bare line feeds, and
+records what Python's `http.client` reads from each. The suite feeds
+the same bytes to this package's reader and asserts the same status,
+reason, fields and body.
 
 ## Licence
 

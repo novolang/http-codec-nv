@@ -4,6 +4,57 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.0 — 2026-09-27
+
+The first implementation of the interface published as 0.0.1: the
+header section and the framing rules, the reader, the encoders and the
+refusals.
+
+### Added
+
+- `h1read` reads requests and responses a byte at a time or in any
+  pieces, with `Content-Length`, chunked and until-close framing, chunk
+  extensions skipped, trailer sections, pipelined messages, interim 1xx
+  responses and the method queue `expect` keeps.  A line may end in a
+  bare line feed, and empty lines before a start line are skipped (RFC
+  9112 section 2.2).  A start line is refused as soon as its first bytes
+  are wrong, not after a whole head.
+- `BodyNotAllowed` is answered when bytes that do not begin a status
+  line follow a 1xx, 204 or 304 response or the answer to `HEAD`.
+- `h1write` checks the method, the target, the status, the reason
+  phrase and every field before it writes them.
+- `tests/h1wire_tests.nv` reads RFC 9112's and RFC 9110's examples and
+  the h11 and httparse edge cases whole, three bytes and one byte at a
+  time.  `tests/differential_tests.nv`, written by
+  `tools/differential.py`, compares the reader with Python's
+  `http.client` over 120 responses.  Every line under `src/` is run by
+  the suites; `bash tests/coverage.sh` prints the number.
+
+### Changed
+
+These break code written against 0.0.x.
+
+- `H1EncodeError` has four more variants: `BadTargetToWrite`,
+  `BadReasonToWrite`, `EmptyChunkToWrite` and `ForbiddenTrailerToWrite`.
+  Each names a message the encoders refuse that the 0.0.x variants had
+  no name for.
+- `H1Reader` has five more fields: `phase`, `remaining`, `methods`,
+  `closed` and `no_body_status`.  A reader is made with `h1read.reader`.
+- `h1msg.is_field_value` refuses every control character but the
+  horizontal tab, as RFC 9110 section 5.5 does, and not only CR, LF and
+  NUL.
+- A lowercase `get` is `ExtensionMethod("get")`, as the 0.0.x tests
+  said, and not `BadMethodToken`, as the 0.0.x README and `h1err`
+  comment said.
+- `finish` answers the next event after the close, and `take` answers
+  the rest.  `parse_head` computes no framing: the reader in its answer
+  has consumed the head and nothing else.
+- A `Transfer-Encoding` naming any coding but `chunked` is refused in a
+  response too.
+- `h1msg` and `h1read` spell the decode error `h1err.H1DecodeError`.
+  The type is the same one.
+- The toolchain floor is 0.13.0.
+
 ## 0.0.3 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

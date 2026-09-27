@@ -1,24 +1,19 @@
 [package]
 name        = "http-codec-nv"
-version     = "0.0.3"
-description = "HTTP/1.1 request and response as a state machine that performs nothing: feed it bytes and take a head, then body chunks, then an end.  Content-Length and chunked framing, a header list with case-insensitive lookup that keeps the case it arrived in, refusals that name the byte offset, and encoders that return bytes.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "HTTP/1.1 request and response as a state machine that performs nothing: feed it bytes and take a head, then body chunks, then an end.  Content-Length and chunked framing, a header list with case-insensitive lookup that keeps the case it arrived in, refusals that name the byte offset, and encoders that return bytes."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used the
+# package yet, and the tests were written against the signatures rather
+# than by a consumer.
+stability   = "experimental"
 
-# `core`: bytes in, events out, and no socket.  HTTP/1.1 is the
-# protocol most often written as "open a connection and then…", and
-# that is exactly the shape this package refuses: nothing here connects,
-# nothing waits, nothing retries and nothing consults a clock.  The one
-# function that takes a stream — `h1read.drain` — BINDS the standard
-# library's `Read[e]` rather than naming an effect, so it costs whatever
-# the caller's source costs and this package's own budget stays empty
-# (SPEC § 5.6).
+# `core`: bytes in, events out, and no socket.  Nothing here connects,
+# waits, retries or reads a clock.  The one function that takes a
+# stream, `h1read.drain`, binds the effect parameter of the standard
+# library's `Read[e]`, so it costs what the caller's source costs and
+# the package declares no effect of its own (SPEC section 5.6).
 layer       = "core"
 
 category    = "networking"
@@ -26,15 +21,13 @@ category    = "networking"
 tags        = ["http", "http1", "rfc9110", "rfc9112", "codec", "parser", "chunked", "sans-io", "state-machine"]
 repository  = "https://github.com/novolang/http-codec-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.13.0"
 
 [docs.pages]
 "README.md" = "HTTP/1.1, without a socket"
 
 [dependencies]
-# None.  A request target is carried as the `Str` it arrived as plus a
-# `H1TargetForm` that says which of RFC 9112 § 3.2's four forms it is;
-# only the absolute-form is a URL, and making every consumer — an
-# embedded one included — take url-nv for the one form it will not meet
-# is a cost with no buyer.  A caller that wants the target parsed hands
-# the `Str` to url-nv itself.  See the README, § What this does not do.
+# None.  A request target is carried as the `Str` it arrived as, with
+# `h1msg.target_form` saying which of the four forms of RFC 9112
+# section 3.2 it has.  Only the absolute form is a URL, and a caller
+# that wants it parsed hands the `Str` to url-nv.
