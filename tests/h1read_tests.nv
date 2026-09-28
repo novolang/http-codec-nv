@@ -154,3 +154,25 @@ fn test_drain_over_a_buffer_costs_nothing() [io]
         Ok(d)  => test.assert(list.len(d.events) == 2)
         Err(_) => test.fail("a well-formed request")
     src.drop()
+
+// A source whose stream fails on every call.
+struct Failing
+    code: Int
+
+impl Read[] for Failing
+    fn read(self, n: Int) -> Result<Bytes, IoError> []
+        Err(IoNotFound)
+
+// What a drain answered, as text: the event count or the refusal.
+fn drained(r: Result<H1Drained, h1err.H1DecodeError>) -> Str
+    match r
+        Ok(d)  => "${list.len(d.events)} events"
+        Err(e) => e.message()
+
+@test
+fn test_drain_reads_a_failing_source_as_the_end_of_the_stream() [io]
+    test.case("a source that fails is a stream that ended")
+    let empty = Buffer.from_str("")
+    test.assert_eq(drained(h1read.drain(a_server_reader(), Failing { code: 0 })),
+        drained(h1read.drain(a_server_reader(), empty)))
+    empty.drop()

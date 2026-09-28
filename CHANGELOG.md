@@ -4,11 +4,14 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
-## 0.1.0 — 2026-09-27
+## 0.1.0 — 2026-09-28
 
 The first implementation of the interface published as 0.0.1: the
 header section and the framing rules, the reader, the encoders and the
 refusals.
+
+A test shows `h1read.drain` reading a source that fails as the end of
+the stream.
 
 ### Added
 
@@ -53,7 +56,7 @@ These break code written against 0.0.x.
   response too.
 - `h1msg` and `h1read` spell the decode error `h1err.H1DecodeError`.
   The type is the same one.
-- The toolchain floor is 0.13.0.
+- The toolchain floor is 0.14.0.
 
 ## 0.0.3 — 2026-09-15
 
